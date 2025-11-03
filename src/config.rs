@@ -9,6 +9,10 @@ pub struct TracerConfig {
   pub drain_interval: Duration,
   /// Maximum number of Python frames captured per allocation.
   pub max_stack_depth: u16,
+  /// Number of native frames to skip before recording the stack.
+  pub native_skip_frames: usize,
+  /// Number of Python frames to skip (when provided externally).
+  pub python_skip_frames: usize,
   /// Per-thread ring buffer size, expressed in bytes.
   pub ring_buffer_bytes: usize,
   /// Sample every N bytes when set (takes precedence over `sampling_rate`).
@@ -25,6 +29,8 @@ impl Default for TracerConfig {
       capture_native: true,
       drain_interval: Duration::from_millis(25),
       max_stack_depth: 1,
+      native_skip_frames: 5,
+      python_skip_frames: 0,
       ring_buffer_bytes: 256 * 1024,
       sampling_bytes: None,
       sampling_rate: 1.0,
@@ -45,6 +51,20 @@ impl TracerConfig {
   #[must_use]
   pub fn with_max_stack_depth(mut self, depth: u16) -> Self {
     self.max_stack_depth = depth;
+    self
+  }
+
+  /// Builder-style helper to adjust native frame skip depth.
+  #[must_use]
+  pub fn with_native_skip_frames(mut self, skip: usize) -> Self {
+    self.native_skip_frames = skip;
+    self
+  }
+
+  /// Builder-style helper to adjust Python frame skip depth.
+  #[must_use]
+  pub fn with_python_skip_frames(mut self, skip: usize) -> Self {
+    self.python_skip_frames = skip;
     self
   }
 }

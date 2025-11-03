@@ -8,31 +8,45 @@ use crate::{
   stack::{FrameMetadata, StackTable},
 };
 
-const DEFAULT_SKIP_FRAMES: usize = 5;
-
 /// Captures stack traces and interns them through the shared stack table.
 #[derive(Debug)]
 pub struct StackCollector {
   capture_native: bool,
   max_depth: usize,
-  skip_frames: usize,
+  native_skip_frames: usize,
+  python_skip_frames: usize,
   stack_table: Arc<StackTable>,
 }
 
 impl StackCollector {
   #[must_use]
-  pub fn capture_and_intern(&self) -> StackId {
-    let frames = if self.capture_native {
-      self.capture_native_frames()
-    } else {
-      Vec::new()
-    };
+  pub fn capture_and_intern(
+    &self,
+    python_frames: Option<&[FrameMetadata]>,
+  ) -> StackId {
+    let mut frames = Vec::with_capacity(self.max_depth);
 
-    let frames = if frames.is_empty() {
-      vec![FrameMetadata::new("<unknown>", "<unknown>", 0)]
-    } else {
-      frames
-    };
+    if let Some(py_frames) = python_frames {
+      for frame in py_frames.iter().skip(self.python_skip_frames) {
+        if frames.len() >= self.max_depth {
+          break;
+        }
+        frames.push(frame.clone());
+      }
+    }
+
+    if self.capture_native && frames.len() < self.max_depth {
+      for frame in self.capture_native_frames() {
+        if frames.len() >= self.max_depth {
+          break;
+        }
+        frames.push(frame);
+      }
+    }
+
+    if frames.is_empty() {
+      frames.push(FrameMetadata::new("<unknown>", "<unknown>", 0));
+    }
 
     self.stack_table.intern(frames)
   }
@@ -40,7 +54,7 @@ impl StackCollector {
   #[must_use]
   fn capture_native_frames(&self) -> Vec<FrameMetadata> {
     let mut frames = Vec::with_capacity(self.max_depth);
-    let mut remaining_skip = self.skip_frames;
+    let mut remaining_skip = self.native_skip_frames;
 
     backtrace::trace(|frame| {
       if remaining_skip > 0 {
@@ -65,7 +79,8 @@ impl StackCollector {
     Self {
       capture_native: config.capture_native,
       max_depth,
-      skip_frames: DEFAULT_SKIP_FRAMES,
+      native_skip_frames: config.native_skip_frames,
+      python_skip_frames: config.python_skip_frames,
       stack_table,
     }
   }
@@ -108,4 +123,45 @@ fn path_to_string(path: &std::path::Path) -> Option<&str> {
 
 fn symbol_name_to_string(name: &SymbolName<'_>) -> String {
   format!("{name}")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::config::TracerConfig;
+  use std::sync::Arc;
+
+  #[test]
+  fn uses_python_frames_when_available() {
+    let mut config = TracerConfig::default();
+    config.capture_native = false;
+    config.max_stack_depth = 3;
+    config.python_skip_frames = 1;
+
+    let table = Arc::new(StackTable::new());
+    let collector = StackCollector::new(Arc::clone(&table), &config);
+    let frames = vec![
+      FrameMetadata::new("hidden.py", "wrapper", 1),
+      FrameMetadata::new("worker.py", "run", 2),
+    ];
+
+    let stack_id = collector.capture_and_intern(Some(&frames));
+    let stack = table.resolve(stack_id).expect("missing stack");
+    assert_eq!(stack.frames().len(), 1);
+    assert_eq!(stack.frames()[0].filename.as_ref(), "worker.py");
+  }
+
+  #[test]
+  fn falls_back_to_unknown_when_no_frames() {
+    let mut config = TracerConfig::default();
+    config.capture_native = false;
+    config.max_stack_depth = 1;
+
+    let table = Arc::new(StackTable::new());
+    let collector = StackCollector::new(Arc::clone(&table), &config);
+
+    let stack_id = collector.capture_and_intern(Some(&[]));
+    let stack = table.resolve(stack_id).expect("missing stack");
+    assert_eq!(stack.frames()[0].filename.as_ref(), "<unknown>");
+  }
 }

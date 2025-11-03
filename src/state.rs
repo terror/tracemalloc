@@ -14,7 +14,7 @@ use crate::{
   event::{AllocationEvent, EventKind, StackId},
   ring_buffer::{DrainAction, ThreadBuffer, ThreadBufferInner},
   snapshot::Snapshot,
-  stack::StackTable,
+  stack::{FrameMetadata, StackTable},
   stack_capture::StackCollector,
 };
 
@@ -26,6 +26,12 @@ thread_local! {
 struct ThreadLocalBuffer {
   buffer: ThreadBuffer,
   tracer_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AllocationRecord {
+  size: usize,
+  stack_id: StackId,
 }
 
 /// Thin builder that customizes `TracerConfig` without exposing all knobs up front.
@@ -53,10 +59,22 @@ impl TracerBuilder {
   }
 
   #[must_use]
+  pub fn native_skip_frames(mut self, skip: usize) -> Self {
+    self.config.native_skip_frames = skip;
+    self
+  }
+
+  #[must_use]
   pub fn new() -> Self {
     Self {
       config: TracerConfig::default(),
     }
+  }
+
+  #[must_use]
+  pub fn python_skip_frames(mut self, skip: usize) -> Self {
+    self.config.python_skip_frames = skip;
+    self
   }
 
   #[must_use]
@@ -81,7 +99,7 @@ impl TracerBuilder {
 #[derive(Debug)]
 struct TracerInner {
   aggregator: Mutex<Aggregator>,
-  allocation_index: Mutex<HashMap<usize, StackId>>,
+  allocation_index: Mutex<HashMap<usize, AllocationRecord>>,
   buffers: Mutex<Vec<Weak<ThreadBufferInner>>>,
   config: TracerConfig,
   enabled: AtomicBool,
@@ -154,8 +172,31 @@ impl Tracer {
     if let Some(event) =
       self
         .inner
-        .prepare_hot_event(EventKind::Allocation, address, size)
+        .prepare_hot_event(EventKind::Allocation, address, size, None)
     {
+      self.enqueue_event(event);
+    }
+  }
+
+  /// Variant of `record_allocation` that uses Python-provided frames when
+  /// available. This is intended to be called from the `CPython` allocator hooks
+  /// once they have captured the interpreter stack.
+  pub fn record_allocation_with_frames(
+    &self,
+    address: usize,
+    size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    if let Some(event) = self.inner.prepare_hot_event(
+      EventKind::Allocation,
+      address,
+      size,
+      Some(frames),
+    ) {
       self.enqueue_event(event);
     }
   }
@@ -167,10 +208,34 @@ impl Tracer {
       return;
     }
 
-    match self
-      .inner
-      .prepare_hot_event(EventKind::Deallocation, address, size)
-    {
+    match self.inner.prepare_hot_event(
+      EventKind::Deallocation,
+      address,
+      size,
+      None,
+    ) {
+      Some(event) => self.enqueue_event(event),
+      None => self.record_dropped_event(1),
+    }
+  }
+
+  /// Deallocation variant that leverages Python-sourced metadata when available.
+  pub fn record_deallocation_with_frames(
+    &self,
+    address: usize,
+    size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_hot_event(
+      EventKind::Deallocation,
+      address,
+      size,
+      Some(frames),
+    ) {
       Some(event) => self.enqueue_event(event),
       None => self.record_dropped_event(1),
     }
@@ -189,6 +254,67 @@ impl Tracer {
     }
 
     self.enqueue_event(event);
+  }
+
+  /// Update aggregated statistics for a reallocation (`PyMem_Realloc` style).
+  /// Generates both a deallocation for the old pointer and an allocation for
+  /// the new pointer. Callers should supply the old allocation size when
+  /// available; otherwise the tracer falls back to the previously recorded
+  /// size.
+  pub fn record_reallocation(
+    &self,
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_reallocation(
+      old_address,
+      old_size,
+      new_address,
+      new_size,
+      None,
+    ) {
+      Some((dealloc, alloc)) => {
+        self.enqueue_event(dealloc);
+        self.enqueue_event(alloc);
+      }
+      None => self.record_dropped_event(2),
+    }
+  }
+
+  /// Reallocation helper with Python frame metadata supplied by the caller.
+  pub fn record_reallocation_with_frames(
+    &self,
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    let frame_option = (!frames.is_empty()).then_some(frames);
+
+    match self.inner.prepare_reallocation(
+      old_address,
+      old_size,
+      new_address,
+      new_size,
+      frame_option,
+    ) {
+      Some((dealloc, alloc)) => {
+        self.enqueue_event(dealloc);
+        self.enqueue_event(alloc);
+      }
+      None => self.record_dropped_event(2),
+    }
   }
 
   pub fn reset(&self) {
@@ -330,15 +456,18 @@ impl TracerInner {
     kind: EventKind,
     address: usize,
     size: usize,
+    frames: Option<&[FrameMetadata]>,
   ) -> Option<AllocationEvent> {
     match kind {
       EventKind::Allocation => {
-        let stack_id = self.stack_collector.capture_and_intern();
+        let stack_id = self
+          .stack_collector
+          .capture_and_intern(frames.filter(|f| !f.is_empty()));
         let mut index = match self.allocation_index.lock() {
           Ok(guard) => guard,
           Err(err) => err.into_inner(),
         };
-        index.insert(address, stack_id);
+        index.insert(address, AllocationRecord { size, stack_id });
         Some(AllocationEvent::new(kind, address, size, stack_id))
       }
       EventKind::Deallocation => {
@@ -346,11 +475,57 @@ impl TracerInner {
           Ok(guard) => guard,
           Err(err) => err.into_inner(),
         };
-        let stack_id = index.remove(&address)?;
-        Some(AllocationEvent::new(kind, address, size, stack_id))
+        let record = index.remove(&address)?;
+        let size = if size == 0 { record.size } else { size };
+        Some(AllocationEvent::new(kind, address, size, record.stack_id))
       }
       EventKind::Dropped { .. } => None,
     }
+  }
+
+  fn prepare_reallocation(
+    &self,
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+    frames: Option<&[FrameMetadata]>,
+  ) -> Option<(AllocationEvent, AllocationEvent)> {
+    let mut index = match self.allocation_index.lock() {
+      Ok(guard) => guard,
+      Err(err) => err.into_inner(),
+    };
+
+    let record = index.remove(&old_address)?;
+
+    let recorded_old_size = if old_size == 0 { record.size } else { old_size };
+    let dealloc = AllocationEvent::new(
+      EventKind::Deallocation,
+      old_address,
+      recorded_old_size,
+      record.stack_id,
+    );
+
+    let stack_id = self
+      .stack_collector
+      .capture_and_intern(frames.filter(|f| !f.is_empty()));
+
+    index.insert(
+      new_address,
+      AllocationRecord {
+        size: new_size,
+        stack_id,
+      },
+    );
+
+    let alloc = AllocationEvent::new(
+      EventKind::Allocation,
+      new_address,
+      new_size,
+      stack_id,
+    );
+
+    Some((dealloc, alloc))
   }
 
   fn register_thread_buffer(&self) -> ThreadBuffer {
@@ -518,6 +693,25 @@ mod tests {
   }
 
   #[test]
+  fn python_frames_are_prioritized_when_provided() {
+    let tracer = Tracer::builder()
+      .capture_native(true)
+      .python_skip_frames(1)
+      .finish();
+    let frames = vec![
+      FrameMetadata::new("internal.py", "wrapper", 1),
+      FrameMetadata::new("app.py", "handler", 42),
+    ];
+    tracer.record_allocation_with_frames(0xdead, 24, &frames);
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot.records().first().expect("missing allocation");
+    let stack = record.stack.as_ref().expect("missing captured stack");
+    assert_eq!(stack.frames()[0].filename.as_ref(), "app.py");
+    assert_eq!(stack.frames()[0].function.as_ref(), "handler");
+  }
+
+  #[test]
   fn deallocation_reuses_allocation_stack_id() {
     let tracer = Tracer::builder().capture_native(true).finish();
     let address = 0xfeed;
@@ -532,6 +726,43 @@ mod tests {
     assert_eq!(record.allocations, 1);
     assert_eq!(record.deallocations, 1);
     assert_eq!(record.current_bytes, 0);
+  }
+
+  #[test]
+  fn reallocation_moves_pointer_and_updates_counters() {
+    let tracer = Tracer::builder().capture_native(false).finish();
+    tracer.record_allocation(0x1, 32);
+    tracer.record_reallocation(0x1, 32, 0x2, 64);
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot.records().first().expect("missing allocation");
+    assert_eq!(record.allocations, 2);
+    assert_eq!(record.deallocations, 1);
+    assert_eq!(record.current_bytes, 64);
+  }
+
+  #[test]
+  fn reallocation_with_python_frames_updates_metadata() {
+    let tracer = Tracer::builder().capture_native(false).finish();
+    tracer.record_allocation(0x1, 16);
+    let frames = vec![FrameMetadata::new("resize.py", "grow", 99)];
+    tracer.record_reallocation_with_frames(0x1, 16, 0x2, 32, &frames);
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot.records().first().expect("missing allocation");
+    let stack = record.stack.as_ref().expect("missing stack metadata");
+    assert_eq!(stack.frames()[0].filename.as_ref(), "resize.py");
+    assert_eq!(record.current_bytes, 32);
+  }
+
+  #[test]
+  fn failed_reallocation_counts_as_two_dropped_events() {
+    let tracer = Tracer::new();
+    tracer.record_reallocation(0xbeef, 10, 0xcafe, 20);
+
+    let snapshot = tracer.snapshot();
+    assert_eq!(snapshot.dropped_events(), 2);
+    assert!(snapshot.records().is_empty());
   }
 
   #[test]

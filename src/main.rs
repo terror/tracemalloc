@@ -5,6 +5,7 @@ fn main() {
   tracer.record_allocation(0x1, 128);
   tracer.record_allocation(0x2, 64);
   tracer.record_deallocation(0x2, 64);
+  tracer.record_reallocation(0x1, 128, 0x3, 256);
 
   let snapshot = tracer.snapshot();
 
