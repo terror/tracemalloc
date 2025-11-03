@@ -191,6 +191,7 @@ dependencies = [
  "dashmap",
  "fastrand",
  "nohash-hasher",
+ "smallvec",
 ]
 
 [[package]]

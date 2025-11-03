@@ -1,4 +1,12 @@
 use super::*;
+use dashmap::{DashMap, mapref::entry::Entry};
+use std::sync::LazyLock;
+
+static FILENAME_INTERNER: LazyLock<StringInterner> =
+  LazyLock::new(StringInterner::default);
+
+static FUNCTION_INTERNER: LazyLock<StringInterner> =
+  LazyLock::new(StringInterner::default);
 
 /// Metadata describing a single frame in a stack trace.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -10,16 +18,29 @@ pub struct FrameMetadata {
 
 impl FrameMetadata {
   #[must_use]
+  pub fn borrowed(filename: &str, function: &str, lineno: u32) -> Self {
+    Self {
+      filename: intern_filename(filename),
+      function: intern_function(function),
+      lineno,
+    }
+  }
+
+  fn from_owned(filename: String, function: String, lineno: u32) -> Self {
+    Self {
+      filename: intern_owned_filename(filename),
+      function: intern_owned_function(function),
+      lineno,
+    }
+  }
+
+  #[must_use]
   pub fn new(
     filename: impl Into<String>,
     function: impl Into<String>,
     lineno: u32,
   ) -> Self {
-    Self {
-      filename: Arc::<str>::from(filename.into()),
-      function: Arc::<str>::from(function.into()),
-      lineno,
-    }
+    Self::from_owned(filename.into(), function.into(), lineno)
   }
 }
 
@@ -42,9 +63,48 @@ impl StackMetadata {
   }
 }
 
+#[derive(Default)]
+struct StringInterner {
+  values: DashMap<Arc<str>, ()>,
+}
+
+impl StringInterner {
+  fn intern(&self, value: &str) -> Arc<str> {
+    if let Some(existing) = self.values.get(value) {
+      return existing.key().clone();
+    }
+
+    let candidate: Arc<str> = Arc::from(value.to_owned());
+
+    match self.values.entry(candidate.clone()) {
+      Entry::Occupied(entry) => entry.key().clone(),
+      Entry::Vacant(entry) => {
+        entry.insert(());
+        candidate
+      }
+    }
+  }
+
+  fn intern_owned(&self, value: String) -> Arc<str> {
+    if let Some(existing) = self.values.get(value.as_str()) {
+      return existing.key().clone();
+    }
+
+    let candidate: Arc<str> = Arc::from(value.into_boxed_str());
+
+    match self.values.entry(candidate.clone()) {
+      Entry::Occupied(entry) => entry.key().clone(),
+      Entry::Vacant(entry) => {
+        entry.insert(());
+        candidate
+      }
+    }
+  }
+}
+
 #[derive(Debug)]
 struct StackTableInner {
-  by_frames: HashMap<Vec<FrameMetadata>, StackId>,
+  by_frames: HashMap<Arc<[FrameMetadata]>, StackId>,
   by_id: HashMap<StackId, Arc<StackMetadata>>,
   next_id: StackId,
 }
@@ -72,18 +132,18 @@ impl StackTable {
   /// stack identifiers gathered outside of the Rust tracer.
   pub fn insert_with_id<I>(&self, stack_id: StackId, frames: I)
   where
-    I: Into<Vec<FrameMetadata>>,
+    I: Into<Arc<[FrameMetadata]>>,
   {
-    let frames: Vec<FrameMetadata> = frames.into();
+    let frames: Arc<[FrameMetadata]> = frames.into();
 
     let mut inner = self.lock_inner();
 
     let metadata = Arc::new(StackMetadata {
-      frames: Arc::from(frames.clone().into_boxed_slice()),
+      frames: Arc::clone(&frames),
       id: stack_id,
     });
 
-    inner.by_frames.insert(frames, stack_id);
+    inner.by_frames.insert(Arc::clone(&frames), stack_id);
     inner.by_id.insert(stack_id, metadata);
 
     if inner.next_id <= stack_id {
@@ -94,13 +154,13 @@ impl StackTable {
   /// Intern the provided stack frames and return their stable identifier.
   pub fn intern<I>(&self, frames: I) -> StackId
   where
-    I: Into<Vec<FrameMetadata>>,
+    I: Into<Arc<[FrameMetadata]>>,
   {
-    let frames: Vec<FrameMetadata> = frames.into();
+    let frames: Arc<[FrameMetadata]> = frames.into();
 
     let mut inner = self.lock_inner();
 
-    if let Some(existing) = inner.by_frames.get(&frames).copied() {
+    if let Some(existing) = inner.by_frames.get(frames.as_ref()).copied() {
       return existing;
     }
 
@@ -109,7 +169,7 @@ impl StackTable {
     inner.next_id = inner.next_id.saturating_add(1);
 
     let metadata = Arc::new(StackMetadata {
-      frames: Arc::from(frames.clone().into_boxed_slice()),
+      frames: Arc::clone(&frames),
       id: stack_id,
     });
 
@@ -137,6 +197,22 @@ impl StackTable {
     let inner = self.lock_inner();
     inner.by_id.get(&stack_id).cloned()
   }
+}
+
+fn intern_filename(value: &str) -> Arc<str> {
+  FILENAME_INTERNER.intern(value)
+}
+
+fn intern_owned_filename(value: String) -> Arc<str> {
+  FILENAME_INTERNER.intern_owned(value)
+}
+
+fn intern_function(value: &str) -> Arc<str> {
+  FUNCTION_INTERNER.intern(value)
+}
+
+fn intern_owned_function(value: String) -> Arc<str> {
+  FUNCTION_INTERNER.intern_owned(value)
 }
 
 #[cfg(test)]

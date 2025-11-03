@@ -9,6 +9,7 @@ backtrace = { version = "0.3", default-features = false, features = ["std"] }
 fastrand = "2"
 dashmap = "6.1.0"
 nohash-hasher = "0.2.0"
+smallvec = "1.13"
 
 [lints.rust]
 mismatched_lifetime_syntaxes = "allow"

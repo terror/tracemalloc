@@ -1,4 +1,7 @@
 use super::*;
+use smallvec::SmallVec;
+
+const STACK_INLINE_DEPTH: usize = 32;
 
 thread_local! {
   static STACK_ID_CACHES: RefCell<Vec<ThreadLocalStackCache>> =
@@ -14,11 +17,11 @@ struct ThreadLocalStackCache {
 
 #[derive(Default)]
 struct StackIdCache {
-  map: HashMap<Vec<FrameMetadata>, StackId>,
+  map: HashMap<Arc<[FrameMetadata]>, StackId>,
 }
 
 impl StackIdCache {
-  fn insert(&mut self, frames: Vec<FrameMetadata>, stack_id: StackId) {
+  fn insert(&mut self, frames: Arc<[FrameMetadata]>, stack_id: StackId) {
     if self.map.len() >= STACK_CACHE_LIMIT {
       self.map.clear();
     }
@@ -30,6 +33,8 @@ impl StackIdCache {
     self.map.get(frames).copied()
   }
 }
+
+type StackFrameBuffer = SmallVec<[FrameMetadata; STACK_INLINE_DEPTH]>;
 
 /// Captures stack traces and interns them through the shared stack table.
 #[derive(Debug)]
@@ -47,7 +52,8 @@ impl StackCollector {
     &self,
     python_frames: Option<&[FrameMetadata]>,
   ) -> StackId {
-    let mut frames = Vec::with_capacity(self.max_depth);
+    let mut frames = StackFrameBuffer::new();
+    frames.reserve(self.max_depth.min(STACK_INLINE_DEPTH));
 
     if let Some(py_frames) = python_frames {
       for frame in py_frames.iter().skip(self.python_skip_frames) {
@@ -59,34 +65,29 @@ impl StackCollector {
     }
 
     if self.capture_native && frames.len() < self.max_depth {
-      for frame in self.capture_native_frames() {
-        if frames.len() >= self.max_depth {
-          break;
-        }
-        frames.push(frame);
-      }
+      self.capture_native_frames_into(&mut frames);
     }
 
     if frames.is_empty() {
-      frames.push(FrameMetadata::new("<unknown>", "<unknown>", 0));
+      frames.push(FrameMetadata::borrowed("<unknown>", "<unknown>", 0));
     }
 
     if let Some(stack_id) =
-      self.with_thread_cache(|cache| cache.lookup(&frames))
+      self.with_thread_cache(|cache| cache.lookup(frames.as_slice()))
     {
       return stack_id;
     }
 
-    let stack_id = self.stack_table.intern(frames.clone());
+    let frames_arc: Arc<[FrameMetadata]> = frames.into_vec().into();
 
-    self.with_thread_cache(|cache| cache.insert(frames, stack_id));
+    let stack_id = self.stack_table.intern(Arc::clone(&frames_arc));
+
+    self.with_thread_cache(|cache| cache.insert(frames_arc, stack_id));
 
     stack_id
   }
 
-  #[must_use]
-  fn capture_native_frames(&self) -> Vec<FrameMetadata> {
-    let mut frames = Vec::with_capacity(self.max_depth);
+  fn capture_native_frames_into(&self, frames: &mut StackFrameBuffer) {
     let mut remaining_skip = self.native_skip_frames;
 
     backtrace::trace(|frame| {
@@ -102,8 +103,6 @@ impl StackCollector {
       frames.push(extract_metadata(frame));
       true
     });
-
-    frames
   }
 
   fn collector_id(&self) -> usize {
