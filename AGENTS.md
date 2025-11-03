@@ -27,63 +27,73 @@ How this project aims to help:
 
 1) Lower overhead, better concurrency
 
-Per-thread ring buffers (fast path):
-On allocation, write a compact event (size, addr, stack-id) into a lock-free/per-thread buffer (e.g., bounded MPSC + epochs). A background worker drains and aggregates. This moves most work off the hot path.
+- Per-thread ring buffers (fast path):
+- On allocation, write a compact event (size, addr, stack-id) into a lock-free/per-thread buffer (e.g., bounded MPSC + epochs). A background worker drains and aggregates. This moves most work off the hot path.
 
 Lock avoidance:
-Use sharded hash maps (by thread or by stack-hash) to aggregate. Rust gives you safe concurrency (e.g., crossbeam, lock-free queues) without GIL semantics.
+
+- Use sharded hash maps (by thread or by stack-hash) to aggregate. Rust gives you safe concurrency (e.g., crossbeam, lock-free queues) without GIL semantics.
 
 No-alloc in the hot path:
-Use fixed-capacity bump allocators or pre-allocated slabs for event records so the tracer doesn’t allocate while handling an allocation (avoids recursion).
+
+- Use fixed-capacity bump allocators or pre-allocated slabs for event records so the tracer doesn’t allocate while handling an allocation (avoids recursion).
 
 2) Much tighter metadata
 
 Aggressive interning:
-Intern file names, function names, and code object identities. Store frame IDs not strings on the hot path.
+
+- Intern file names, function names, and code object identities. Store frame IDs not strings on the hot path.
 
 Traceback compression:
 
-Store stack traces as prefix-compressed vectors of frame IDs.
-
-Use hash-consing for identical tracebacks.
-
-Delta-encode across snapshots so diffs are cheap to store.
+- Store stack traces as prefix-compressed vectors of frame IDs.
+- Use hash-consing for identical tracebacks.
+- Delta-encode across snapshots so diffs are cheap to store.
 
 Configurable depth & sampling:
-Offer probabilistic sampling (like Go’s pprof): record k% of allocations or every Nth byte. This caps overhead for large apps.
+
+- Offer probabilistic sampling (like Go’s pprof): record k% of allocations or every Nth byte. This caps overhead for large apps.
 
 3) Better visibility (optionally beyond CPython)
 
-Allocator interposition (opt-in):
-Provide a mode that wraps the process global allocator (jemalloc/mimalloc/system) inside the Python process to observe native extension allocations too. This is experimental but powerful.
+- Allocator interposition (opt-in):
+- Provide a mode that wraps the process global allocator (jemalloc/mimalloc/system) inside the Python process to observe native extension allocations too. This is experimental but powerful.
 
 Domain tagging:
-Keep Python’s “domain” concept but extend it: tag allocations by thread, interpreter (PEP 554), and extension module (when detectable via call site).
+
+- Keep Python’s “domain” concept but extend it: tag allocations by thread, interpreter (PEP 554), and extension module (when detectable via call site).
 
 4) Superior snapshots & tooling
 
 Streaming snapshots:
-Write snapshots incrementally to an mmap’d file or a binary log (e.g., zstd-framed) so huge programs don’t need a giant in-mem structure.
+
+- Write snapshots incrementally to an mmap’d file or a binary log (e.g., zstd-framed) so huge programs don’t need a giant in-mem structure.
 
 Instant diffs:
-Maintain cumulative counters per (traceback, domain) so compare_to() is O(changed-buckets) rather than O(total).
+
+- Maintain cumulative counters per (traceback, domain) so compare_to() is O(changed-buckets) rather than O(total).
 
 Open formats:
-Export pprof-compatible heap profiles; integrate with existing viewers (Speedscope, pprof, Perfetto).
+
+- Export pprof-compatible heap profiles; integrate with existing viewers (Speedscope, pprof, Perfetto).
 
 Temporal slicing:
-Because events are timestamped as they’re drained, you can query “allocations between t1 and t2” without taking a full snapshot.
+
+- Because events are timestamped as they’re drained, you can query “allocations between t1 and t2” without taking a full snapshot.
 
 5) Robustness & safety
 
 Reentrancy guard:
-A thread-local “in_tracer” flag prevents recursion if the tracer itself needs memory (fallback to a tiny emergency buffer).
+
+- A thread-local “in_tracer” flag prevents recursion if the tracer itself needs memory (fallback to a tiny emergency buffer).
 
 Architecture sketch:
 
 Backoff & lossy modes:
-If buffers fill up, drop events with counters (so you know what you missed) rather than blocking application threads.
 
+- If buffers fill up, drop events with counters (so you know what you missed) rather than blocking application threads.
+
+```
 +------------------------------+             +-------------------------------+
 | CPython alloc hooks (PEP445) |  ----->     |  Rust tracer core (crate)     |
 |  PyMem_* / PyObject_*        |             |                               |
@@ -94,6 +104,7 @@ If buffers fill up, drop events with counters (so you know what you missed) rath
       | rust_tracemalloc Python   |          |  - Exporters (pprof, JSON)    |
       | module: start/stop/snap.. |          +-------------------------------+
       +---------------------------+
+```
 
 Hot path (allocation)
 
@@ -134,67 +145,52 @@ tracemalloc.iter_events(from_ts=..., to_ts=...) for streaming analysis
 tracemalloc.set_filter(lambda frame: not frame.filename.endswith('.venv/...'))
 ```
 
-Implementation tips (Rust)
+Implementation tips (Rust):
 
-FFI layer: pyo3 + maturin for packaging; limited Python object work on the hot path—prefer storing PyCodeObject* IDs and resolve lazily.
+- FFI layer: pyo3 + maturin for packaging; limited Python object work on the hot path—prefer storing PyCodeObject* IDs and resolve lazily.
 
 Data structures:
 
-DashMap (or custom shard) for aggregations keyed by (StackId, Domain).
-
-nohash_hasher::BuildNoHashHasher<u64> if you use stable 64-bit stack IDs.
-
-stack-vec/small-vec for short traces to avoid heap allocs.
+- DashMap (or custom shard) for aggregations keyed by (StackId, Domain).
+- nohash_hasher::BuildNoHashHasher<u64> if you use stable 64-bit stack IDs.
+- stack-vec/small-vec for short traces to avoid heap allocs.
 
 Stack capture:
 
-For Python frames: PyThreadState_GetFrame (careful with overhead) or CPython’s fast frame APIs when available. Cache mapping from instruction pointer → (filename, lineno) when native=True.
-
-For native frames: backtrace/unwind crates; symbolize off the hot path.
-
-Compression: zstd dictionary training over repeated tracebacks; prefix-trie for frame sequences.
+- For Python frames: PyThreadState_GetFrame (careful with overhead) or CPython’s fast frame APIs when available. Cache mapping from instruction pointer → (filename, lineno) when native=True.
+- For native frames: backtrace/unwind crates; symbolize off the hot path.
+- Compression: zstd dictionary training over repeated tracebacks; prefix-trie for frame sequences.
 
 Testing & safety:
 
-Fuzz snapshot readers.
+- Fuzz snapshot readers.
+- Stress with allocation storms (e.g., regex parsing, JSON loads).
+- Validate that tracer never allocates on hot path under low memory.
 
-Stress with allocation storms (e.g., regex parsing, JSON loads).
+What gains to expect:
 
-Validate that tracer never allocates on hot path under low memory.
+- Lower CPU overhead under heavy allocation because most work shifts to per-thread buffers + background aggregation.
+- Less memory for metadata via interning/compression (tracebacks are highly repetitive).
+- Broader coverage (optional native mode) surfaces leaks in C extensions that tracemalloc misses.
+- Better operability thanks to streaming logs and pprof/Perfetto exports.
 
-What gains to expect
+Pitfalls to watch:
 
-Lower CPU overhead under heavy allocation because most work shifts to per-thread buffers + background aggregation.
-
-Less memory for metadata via interning/compression (tracebacks are highly repetitive).
-
-Broader coverage (optional native mode) surfaces leaks in C extensions that tracemalloc misses.
-
-Better operability thanks to streaming logs and pprof/Perfetto exports.
-
-Pitfalls to watch
-
-Signal/async safety: don’t do frame walking in signal handlers; coordinate with faulthandler.
-
-Interpreter shutdown: flush buffers early; keep snapshot writers robust when Python objects are being torn down.
-
-Multi-interpreter (PEP 554): keep per-interpreter state; don’t share intern tables unless explicitly configured.
+- Signal/async safety: don’t do frame walking in signal handlers; coordinate with faulthandler.
+- Interpreter shutdown: flush buffers early; keep snapshot writers robust when Python objects are being torn down.
+- Multi-interpreter (PEP 554): keep per-interpreter state; don’t share intern tables unless explicitly configured.
 
 Platform quirks: Windows stack unwinding, macOS hardened runtime symbolization, musl vs glibc differences.
 
-A minimal “first milestone”
+A minimal “first milestone”:
 
-Wrap Py allocators; record (size, ptr) with sampling and nframe=1 (filename:lineno only).
-
-Per-thread ring buffers + background aggregator keyed by (filename:lineno).
-
-start/stop/take_snapshot/statistics parity with Python; unit tests mirroring the stdlib tests.
-
-Basic JSON export + pprof heap export.
-
----
+- Wrap Py allocators; record (size, ptr) with sampling and nframe=1 (filename:lineno only).
+- Per-thread ring buffers + background aggregator keyed by (filename:lineno).
+- start/stop/take_snapshot/statistics parity with Python; unit tests mirroring the stdlib tests.
+- Basic JSON export + pprof heap export.
 
 General tips:
+
 - Use `cargo add` if you need to add dependencies.
 - Make extensive use of `cargo fmt`, `cargo clippy` and `cargo test` in between
   code changes.

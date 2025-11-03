@@ -16,6 +16,128 @@ struct AllocationRecord {
   stack_id: StackId,
 }
 
+#[derive(Debug)]
+enum HotEvent {
+  Missing,
+  Sampled(AllocationEvent),
+  Skipped,
+}
+
+#[derive(Debug)]
+enum PreparedReallocation {
+  Events {
+    allocation: Option<AllocationEvent>,
+    deallocation: Option<AllocationEvent>,
+  },
+  Missing,
+  Skipped,
+}
+
+#[derive(Debug)]
+struct SamplingState {
+  bytes: Option<SamplingBytes>,
+  rate: SamplingRate,
+}
+
+#[derive(Debug)]
+struct SamplingBytes {
+  interval: std::num::NonZeroU64,
+  next_sample: AtomicU64,
+  total_observed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SamplingRate {
+  All,
+  Fraction(f64),
+  None,
+}
+
+impl SamplingState {
+  fn is_enabled(&self) -> bool {
+    self.bytes.is_some() || !matches!(self.rate, SamplingRate::All)
+  }
+
+  fn new(config: &TracerConfig) -> Self {
+    let bytes = config
+      .sampling_bytes
+      .and_then(std::num::NonZeroU64::new)
+      .map(SamplingBytes::new);
+
+    let rate = if bytes.is_some() {
+      SamplingRate::All
+    } else if config.sampling_rate <= 0.0 {
+      SamplingRate::None
+    } else if config.sampling_rate >= 1.0 {
+      SamplingRate::All
+    } else {
+      SamplingRate::Fraction(config.sampling_rate)
+    };
+
+    Self { bytes, rate }
+  }
+
+  fn should_sample(&self, size: usize) -> bool {
+    if let Some(bytes) = &self.bytes {
+      return bytes.should_sample(size);
+    }
+
+    match self.rate {
+      SamplingRate::All => true,
+      SamplingRate::None => false,
+      SamplingRate::Fraction(probability) => {
+        debug_assert!(
+          (0.0..=1.0).contains(&probability),
+          "probability must be clamped to [0.0, 1.0]"
+        );
+        fastrand::f64() < probability
+      }
+    }
+  }
+}
+
+impl SamplingBytes {
+  fn new(interval: std::num::NonZeroU64) -> Self {
+    let start = interval.get();
+
+    Self {
+      interval,
+      next_sample: AtomicU64::new(start),
+      total_observed: AtomicU64::new(0),
+    }
+  }
+
+  fn should_sample(&self, size: usize) -> bool {
+    let size_u64 = match u64::try_from(size) {
+      Ok(0) => return false,
+      Ok(value) => value,
+      Err(_) => u64::MAX,
+    };
+
+    let previous = self.total_observed.fetch_add(size_u64, Ordering::Relaxed);
+    let total = previous.saturating_add(size_u64);
+
+    loop {
+      let next = self.next_sample.load(Ordering::Acquire);
+
+      if total < next {
+        return false;
+      }
+
+      let interval = self.interval.get();
+      let new_next = next.saturating_add(interval.max(1));
+
+      if self
+        .next_sample
+        .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+      {
+        return true;
+      }
+    }
+  }
+}
+
 /// Thin builder that customizes `TracerConfig` without exposing all knobs up front.
 #[derive(Debug, Default)]
 pub struct TracerBuilder {
@@ -86,6 +208,7 @@ struct TracerInner {
   config: TracerConfig,
   enabled: AtomicBool,
   pending_flush: AtomicBool,
+  sampling: SamplingState,
   stack_collector: StackCollector,
   stack_table: Arc<StackTable>,
   stop_flag: AtomicBool,
@@ -151,12 +274,15 @@ impl Tracer {
       return;
     }
 
-    if let Some(event) =
-      self
-        .inner
-        .prepare_hot_event(EventKind::Allocation, address, size, None)
-    {
-      self.enqueue_event(event);
+    match self.inner.prepare_hot_event(
+      EventKind::Allocation,
+      address,
+      size,
+      None,
+    ) {
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
     }
   }
 
@@ -173,13 +299,15 @@ impl Tracer {
       return;
     }
 
-    if let Some(event) = self.inner.prepare_hot_event(
+    match self.inner.prepare_hot_event(
       EventKind::Allocation,
       address,
       size,
       Some(frames),
     ) {
-      self.enqueue_event(event);
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
     }
   }
 
@@ -196,8 +324,9 @@ impl Tracer {
       size,
       None,
     ) {
-      Some(event) => self.enqueue_event(event),
-      None => self.record_dropped_event(1),
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
     }
   }
 
@@ -218,8 +347,9 @@ impl Tracer {
       size,
       Some(frames),
     ) {
-      Some(event) => self.enqueue_event(event),
-      None => self.record_dropped_event(1),
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
     }
   }
 
@@ -262,11 +392,20 @@ impl Tracer {
       new_size,
       None,
     ) {
-      Some((dealloc, alloc)) => {
-        self.enqueue_event(dealloc);
-        self.enqueue_event(alloc);
+      PreparedReallocation::Events {
+        deallocation,
+        allocation,
+      } => {
+        if let Some(event) = deallocation {
+          self.enqueue_event(event);
+        }
+
+        if let Some(event) = allocation {
+          self.enqueue_event(event);
+        }
       }
-      None => self.record_dropped_event(2),
+      PreparedReallocation::Skipped => {}
+      PreparedReallocation::Missing => self.record_dropped_event(2),
     }
   }
 
@@ -292,11 +431,20 @@ impl Tracer {
       new_size,
       frame_option,
     ) {
-      Some((dealloc, alloc)) => {
-        self.enqueue_event(dealloc);
-        self.enqueue_event(alloc);
+      PreparedReallocation::Events {
+        deallocation,
+        allocation,
+      } => {
+        if let Some(event) = deallocation {
+          self.enqueue_event(event);
+        }
+
+        if let Some(event) = allocation {
+          self.enqueue_event(event);
+        }
       }
-      None => self.record_dropped_event(2),
+      PreparedReallocation::Skipped => {}
+      PreparedReallocation::Missing => self.record_dropped_event(2),
     }
   }
 
@@ -424,6 +572,7 @@ impl TracerInner {
 
     let stack_collector =
       StackCollector::new(Arc::clone(&stack_table), &config);
+    let sampling = SamplingState::new(&config);
 
     Self {
       aggregator: Mutex::new(Aggregator::new(Arc::clone(&stack_table))),
@@ -432,6 +581,7 @@ impl TracerInner {
       config,
       enabled,
       pending_flush: AtomicBool::new(false),
+      sampling,
       stack_collector,
       stack_table,
       stop_flag: AtomicBool::new(false),
@@ -452,9 +602,13 @@ impl TracerInner {
     address: usize,
     size: usize,
     frames: Option<&[FrameMetadata]>,
-  ) -> Option<AllocationEvent> {
+  ) -> HotEvent {
     match kind {
       EventKind::Allocation => {
+        if !self.sampling.should_sample(size) {
+          return HotEvent::Skipped;
+        }
+
         let stack_id = self
           .stack_collector
           .capture_and_intern(frames.filter(|f| !f.is_empty()));
@@ -466,7 +620,7 @@ impl TracerInner {
 
         index.insert(address, AllocationRecord { size, stack_id });
 
-        Some(AllocationEvent::new(kind, address, size, stack_id))
+        HotEvent::Sampled(AllocationEvent::new(kind, address, size, stack_id))
       }
       EventKind::Deallocation => {
         let mut index = match self.allocation_index.lock() {
@@ -474,13 +628,24 @@ impl TracerInner {
           Err(err) => err.into_inner(),
         };
 
-        let record = index.remove(&address)?;
+        let Some(record) = index.remove(&address) else {
+          return if self.sampling.is_enabled() {
+            HotEvent::Skipped
+          } else {
+            HotEvent::Missing
+          };
+        };
 
         let size = if size == 0 { record.size } else { size };
 
-        Some(AllocationEvent::new(kind, address, size, record.stack_id))
+        HotEvent::Sampled(AllocationEvent::new(
+          kind,
+          address,
+          size,
+          record.stack_id,
+        ))
       }
-      EventKind::Dropped { .. } => None,
+      EventKind::Dropped { .. } => HotEvent::Skipped,
     }
   }
 
@@ -491,13 +656,19 @@ impl TracerInner {
     new_address: usize,
     new_size: usize,
     frames: Option<&[FrameMetadata]>,
-  ) -> Option<(AllocationEvent, AllocationEvent)> {
+  ) -> PreparedReallocation {
     let mut index = match self.allocation_index.lock() {
       Ok(guard) => guard,
       Err(err) => err.into_inner(),
     };
 
-    let record = index.remove(&old_address)?;
+    let Some(record) = index.remove(&old_address) else {
+      return if self.sampling.is_enabled() {
+        PreparedReallocation::Skipped
+      } else {
+        PreparedReallocation::Missing
+      };
+    };
 
     let recorded_old_size = if old_size == 0 { record.size } else { old_size };
 
@@ -507,6 +678,13 @@ impl TracerInner {
       recorded_old_size,
       record.stack_id,
     );
+
+    if new_size == 0 || !self.sampling.should_sample(new_size) {
+      return PreparedReallocation::Events {
+        allocation: None,
+        deallocation: Some(dealloc),
+      };
+    }
 
     let stack_id = self
       .stack_collector
@@ -527,7 +705,10 @@ impl TracerInner {
       stack_id,
     );
 
-    Some((dealloc, alloc))
+    PreparedReallocation::Events {
+      allocation: Some(alloc),
+      deallocation: Some(dealloc),
+    }
   }
 
   fn register_thread_buffer(&self) -> ThreadBuffer {
@@ -794,6 +975,62 @@ mod tests {
 
     assert_eq!(snapshot.dropped_events(), 2);
     assert!(snapshot.records().is_empty());
+  }
+
+  #[test]
+  fn sampling_rate_zero_disables_tracing() {
+    let mut config = TracerConfig::default();
+    config.capture_native = false;
+    config.sampling_rate = 0.0;
+
+    let tracer = Tracer::with_config(config);
+
+    tracer.record_allocation(0x1, 64);
+    tracer.record_deallocation(0x1, 64);
+
+    let snapshot = tracer.snapshot();
+
+    assert!(
+      snapshot.records().is_empty(),
+      "sampling disabled should skip events"
+    );
+
+    assert_eq!(snapshot.dropped_events(), 0);
+  }
+
+  #[test]
+  fn sampling_bytes_limits_events() {
+    let mut config = TracerConfig::default();
+    config.capture_native = false;
+    config.sampling_bytes = Some(128);
+
+    let tracer = Tracer::with_config(config);
+
+    for offset in 0..10usize {
+      tracer.record_allocation(0x1000 + offset, 32);
+    }
+
+    let snapshot = tracer.snapshot();
+
+    let total_allocs: u64 = snapshot
+      .records()
+      .iter()
+      .map(|record| record.allocations)
+      .sum();
+
+    let total_bytes: i64 = snapshot
+      .records()
+      .iter()
+      .map(|record| record.current_bytes)
+      .sum();
+
+    assert_eq!(
+      total_allocs, 2,
+      "expected two sampled allocations at 128-byte intervals"
+    );
+
+    assert_eq!(total_bytes, 64);
+    assert_eq!(snapshot.dropped_events(), 0);
   }
 
   #[test]
