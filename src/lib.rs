@@ -15,9 +15,10 @@ mod state;
 use {
   backtrace::{Frame, SymbolName},
   crossbeam_queue::ArrayQueue,
-  dashmap::DashMap,
+  dashmap::{DashMap, mapref::entry::Entry},
   nohash_hasher::BuildNoHashHasher,
   ring_buffer::ThreadBufferInner,
+  smallvec::SmallVec,
   snapshot::SnapshotRecord,
   stack_capture::StackCollector,
   std::{
@@ -26,7 +27,7 @@ use {
     ffi::OsStr,
     mem::size_of,
     sync::{
-      Arc, Condvar, Mutex, MutexGuard, Weak,
+      Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak,
       atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,

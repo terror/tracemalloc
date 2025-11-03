@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Demonstration workload that uses the rust_tracemalloc extension."
 readme = "README.md"
 requires-python = ">=3.12.3"
-dependencies = []
+dependencies = ["rust-tracemalloc"]
 
 [tool.ruff]
 src = ["src"]
@@ -19,3 +19,6 @@ docstring-code-format = true
 docstring-code-line-length = 20
 indent-style = "space"
 quote-style = "single"
+
+[tool.uv.sources]
+rust-tracemalloc = { path = "../py", editable = true }

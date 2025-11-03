@@ -1,5 +1,4 @@
 use super::*;
-use smallvec::SmallVec;
 
 const STACK_INLINE_DEPTH: usize = 32;
 

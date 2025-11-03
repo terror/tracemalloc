@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust-tracemalloc"
+version = "0.1.0"
+description = "Rust-accelerated tracemalloc extension module"
+requires-python = ">=3.12"
+readme = { file = "../README.md", content-type = "text/markdown" }
+license = { file = "../LICENSE" }
+
+[project.optional-dependencies]
+dev = ["maturin>=1.5,<2.0"]
+
+[tool.maturin]
+features = ["extension-module"]

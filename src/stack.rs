@@ -1,6 +1,4 @@
 use super::*;
-use dashmap::{DashMap, mapref::entry::Entry};
-use std::sync::LazyLock;
 
 static FILENAME_INTERNER: LazyLock<StringInterner> =
   LazyLock::new(StringInterner::default);
