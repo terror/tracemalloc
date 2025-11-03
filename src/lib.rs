@@ -15,6 +15,8 @@ mod state;
 use {
   backtrace::{Frame, SymbolName},
   crossbeam_queue::ArrayQueue,
+  dashmap::DashMap,
+  nohash_hasher::BuildNoHashHasher,
   ring_buffer::ThreadBufferInner,
   snapshot::SnapshotRecord,
   stack_capture::StackCollector,

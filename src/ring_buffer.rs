@@ -111,9 +111,10 @@ mod tests {
 
   #[test]
   fn signals_flush_when_capacity_reached() {
-    let mut config = TracerConfig::default();
-
-    config.ring_buffer_bytes = size_of::<AllocationEvent>() * 2;
+    let config = TracerConfig {
+      ring_buffer_bytes: size_of::<AllocationEvent>() * 2,
+      ..TracerConfig::default()
+    };
 
     let buffer = ThreadBuffer::new(&config);
 
@@ -147,9 +148,10 @@ mod tests {
 
   #[test]
   fn tracks_dropped_events_when_queue_full() {
-    let mut config = TracerConfig::default();
-
-    config.ring_buffer_bytes = size_of::<AllocationEvent>();
+    let config = TracerConfig {
+      ring_buffer_bytes: size_of::<AllocationEvent>(),
+      ..TracerConfig::default()
+    };
 
     let buffer = ThreadBuffer::new(&config);
     let _ = buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0));

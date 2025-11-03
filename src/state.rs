@@ -16,6 +16,9 @@ struct AllocationRecord {
   stack_id: StackId,
 }
 
+type AllocationIndex =
+  DashMap<usize, AllocationRecord, BuildNoHashHasher<usize>>;
+
 #[derive(Debug)]
 enum HotEvent {
   Missing,
@@ -203,7 +206,7 @@ impl TracerBuilder {
 #[derive(Debug)]
 struct TracerInner {
   aggregator: Mutex<Aggregator>,
-  allocation_index: Mutex<HashMap<usize, AllocationRecord>>,
+  allocation_index: AllocationIndex,
   buffers: Mutex<Vec<Weak<ThreadBufferInner>>>,
   config: TracerConfig,
   enabled: AtomicBool,
@@ -455,9 +458,7 @@ impl Tracer {
       aggregator.reset();
     }
 
-    if let Ok(mut allocations) = self.inner.allocation_index.lock() {
-      allocations.clear();
-    }
+    self.inner.allocation_index.clear();
   }
 
   /// Produce a point-in-time snapshot of the aggregated allocations.
@@ -576,7 +577,9 @@ impl TracerInner {
 
     Self {
       aggregator: Mutex::new(Aggregator::new(Arc::clone(&stack_table))),
-      allocation_index: Mutex::new(HashMap::new()),
+      allocation_index: DashMap::with_hasher(
+        BuildNoHashHasher::<usize>::default(),
+      ),
       buffers: Mutex::new(Vec::new()),
       config,
       enabled,
@@ -613,22 +616,14 @@ impl TracerInner {
           .stack_collector
           .capture_and_intern(frames.filter(|f| !f.is_empty()));
 
-        let mut index = match self.allocation_index.lock() {
-          Ok(guard) => guard,
-          Err(err) => err.into_inner(),
-        };
-
-        index.insert(address, AllocationRecord { size, stack_id });
+        self
+          .allocation_index
+          .insert(address, AllocationRecord { size, stack_id });
 
         HotEvent::Sampled(AllocationEvent::new(kind, address, size, stack_id))
       }
       EventKind::Deallocation => {
-        let mut index = match self.allocation_index.lock() {
-          Ok(guard) => guard,
-          Err(err) => err.into_inner(),
-        };
-
-        let Some(record) = index.remove(&address) else {
+        let Some((_, record)) = self.allocation_index.remove(&address) else {
           return if self.sampling.is_enabled() {
             HotEvent::Skipped
           } else {
@@ -657,12 +652,7 @@ impl TracerInner {
     new_size: usize,
     frames: Option<&[FrameMetadata]>,
   ) -> PreparedReallocation {
-    let mut index = match self.allocation_index.lock() {
-      Ok(guard) => guard,
-      Err(err) => err.into_inner(),
-    };
-
-    let Some(record) = index.remove(&old_address) else {
+    let Some((_, record)) = self.allocation_index.remove(&old_address) else {
       return if self.sampling.is_enabled() {
         PreparedReallocation::Skipped
       } else {
@@ -690,7 +680,7 @@ impl TracerInner {
       .stack_collector
       .capture_and_intern(frames.filter(|f| !f.is_empty()));
 
-    index.insert(
+    self.allocation_index.insert(
       new_address,
       AllocationRecord {
         size: new_size,
@@ -979,9 +969,11 @@ mod tests {
 
   #[test]
   fn sampling_rate_zero_disables_tracing() {
-    let mut config = TracerConfig::default();
-    config.capture_native = false;
-    config.sampling_rate = 0.0;
+    let config = TracerConfig {
+      capture_native: false,
+      sampling_rate: 0.0,
+      ..TracerConfig::default()
+    };
 
     let tracer = Tracer::with_config(config);
 
@@ -1000,9 +992,11 @@ mod tests {
 
   #[test]
   fn sampling_bytes_limits_events() {
-    let mut config = TracerConfig::default();
-    config.capture_native = false;
-    config.sampling_bytes = Some(128);
+    let config = TracerConfig {
+      capture_native: false,
+      sampling_bytes: Some(128),
+      ..TracerConfig::default()
+    };
 
     let tracer = Tracer::with_config(config);
 

@@ -9,7 +9,7 @@ default:
   just --list
 
 clippy:
-  cargo clippy
+  cargo clippy --all --all-targets
 
 fmt:
   cargo fmt
