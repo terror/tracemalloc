@@ -1,22 +1,4 @@
-use std::{
-  cell::RefCell,
-  collections::HashMap,
-  sync::{
-    Arc, Condvar, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
-  },
-  thread,
-};
-
-use crate::{
-  aggregator::Aggregator,
-  config::TracerConfig,
-  event::{AllocationEvent, EventKind, StackId},
-  ring_buffer::{DrainAction, ThreadBuffer, ThreadBufferInner},
-  snapshot::Snapshot,
-  stack::{FrameMetadata, StackTable},
-  stack_capture::StackCollector,
-};
+use super::*;
 
 thread_local! {
   static THREAD_BUFFERS: RefCell<Vec<ThreadLocalBuffer>> =
@@ -257,6 +239,7 @@ impl Tracer {
   }
 
   /// Update aggregated statistics for a reallocation (`PyMem_Realloc` style).
+  ///
   /// Generates both a deallocation for the old pointer and an allocation for
   /// the new pointer. Callers should supply the old allocation size when
   /// available; otherwise the tracer falls back to the previously recorded
@@ -319,9 +302,11 @@ impl Tracer {
 
   pub fn reset(&self) {
     self.inner.drain_buffers();
+
     if let Ok(mut aggregator) = self.inner.aggregator.lock() {
       aggregator.reset();
     }
+
     if let Ok(mut allocations) = self.inner.allocation_index.lock() {
       allocations.clear();
     }
@@ -346,8 +331,10 @@ impl Tracer {
 
   fn thread_buffer(&self) -> ThreadBuffer {
     let tracer_id = Arc::as_ptr(&self.inner) as usize;
+
     THREAD_BUFFERS.with(|storage| {
       let mut storage = storage.borrow_mut();
+
       if let Some(entry) =
         storage.iter().find(|entry| entry.tracer_id == tracer_id)
       {
@@ -355,10 +342,12 @@ impl Tracer {
       }
 
       let buffer = self.inner.register_thread_buffer();
+
       storage.push(ThreadLocalBuffer {
         tracer_id,
         buffer: buffer.clone(),
       });
+
       buffer
     })
   }
@@ -400,9 +389,11 @@ impl TracerInner {
 
     {
       let mut buffers = self.buffers.lock().expect("buffers poisoned");
+
       buffers.retain(|weak| {
         if let Some(buffer) = weak.upgrade() {
           let dropped = buffer.drain_into(&mut events);
+
           if dropped > 0 {
             events.push(AllocationEvent::new(
               EventKind::Dropped { count: dropped },
@@ -411,6 +402,7 @@ impl TracerInner {
               0,
             ));
           }
+
           true
         } else {
           false
@@ -427,9 +419,12 @@ impl TracerInner {
 
   fn new(config: TracerConfig) -> Self {
     let enabled = AtomicBool::new(config.start_enabled);
+
     let stack_table = Arc::new(StackTable::new());
+
     let stack_collector =
       StackCollector::new(Arc::clone(&stack_table), &config);
+
     Self {
       aggregator: Mutex::new(Aggregator::new(Arc::clone(&stack_table))),
       allocation_index: Mutex::new(HashMap::new()),
@@ -463,11 +458,14 @@ impl TracerInner {
         let stack_id = self
           .stack_collector
           .capture_and_intern(frames.filter(|f| !f.is_empty()));
+
         let mut index = match self.allocation_index.lock() {
           Ok(guard) => guard,
           Err(err) => err.into_inner(),
         };
+
         index.insert(address, AllocationRecord { size, stack_id });
+
         Some(AllocationEvent::new(kind, address, size, stack_id))
       }
       EventKind::Deallocation => {
@@ -475,8 +473,11 @@ impl TracerInner {
           Ok(guard) => guard,
           Err(err) => err.into_inner(),
         };
+
         let record = index.remove(&address)?;
+
         let size = if size == 0 { record.size } else { size };
+
         Some(AllocationEvent::new(kind, address, size, record.stack_id))
       }
       EventKind::Dropped { .. } => None,
@@ -499,6 +500,7 @@ impl TracerInner {
     let record = index.remove(&old_address)?;
 
     let recorded_old_size = if old_size == 0 { record.size } else { old_size };
+
     let dealloc = AllocationEvent::new(
       EventKind::Deallocation,
       old_address,
@@ -530,9 +532,12 @@ impl TracerInner {
 
   fn register_thread_buffer(&self) -> ThreadBuffer {
     let buffer = ThreadBuffer::new(&self.config);
+
     let weak = buffer.downgrade();
+
     let mut buffers = self.buffers.lock().expect("buffers poisoned");
     buffers.push(weak);
+
     buffer
   }
 
@@ -542,13 +547,16 @@ impl TracerInner {
         Ok(guard) => guard,
         Err(err) => err.into_inner(),
       };
+
       drop(guard);
+
       self.worker_sync.condvar.notify_all();
 
       let mut handle = match self.worker_handle.lock() {
         Ok(handle) => handle,
         Err(err) => err.into_inner(),
       };
+
       if let Some(join_handle) = handle.take() {
         let _ = join_handle.join();
       }
@@ -569,6 +577,7 @@ impl TracerInner {
 
       let mut guard =
         self.worker_sync.lock.lock().expect("worker lock poisoned");
+
       if self.stop_flag.load(Ordering::Acquire) {
         drop(guard);
         break;
@@ -580,8 +589,10 @@ impl TracerInner {
           .condvar
           .wait_timeout(guard, self.config.drain_interval)
           .expect("worker condvar poisoned");
+
         guard = g;
       }
+
       drop(guard);
     }
 
@@ -590,12 +601,14 @@ impl TracerInner {
 
   fn start_worker(this: &Arc<Self>) {
     let worker = Arc::clone(this);
+
     let handle = thread::Builder::new()
       .name("tracemalloc-drain".into())
       .spawn(move || worker.run_worker())
       .expect("failed to spawn tracemalloc drain worker");
 
     let mut slot = this.worker_handle.lock().expect("worker handle poisoned");
+
     *slot = Some(handle);
   }
 }
@@ -609,12 +622,11 @@ impl Drop for TracerInner {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::event::{AllocationEvent, EventKind};
-  use crate::stack::FrameMetadata;
 
   #[test]
   fn disabled_tracer_drops_events() {
     let tracer = Tracer::builder().start_enabled(false).finish();
+
     tracer.record_event(AllocationEvent::new(
       EventKind::Allocation,
       0x1,
@@ -628,6 +640,7 @@ mod tests {
   #[test]
   fn enabled_tracer_collects_events() {
     let tracer = Tracer::new();
+
     tracer.record_event(AllocationEvent::new(
       EventKind::Allocation,
       0x1,
@@ -641,6 +654,7 @@ mod tests {
   #[test]
   fn snapshot_drains_thread_buffers() {
     let tracer = Tracer::new();
+
     tracer.record_event(AllocationEvent::new(
       EventKind::Allocation,
       0x1,
@@ -648,8 +662,8 @@ mod tests {
       99,
     ));
 
-    // Snapshot should force a synchronous drain even if the worker has not run yet.
     let snapshot = tracer.snapshot();
+
     assert!(
       snapshot
         .records()
@@ -662,9 +676,11 @@ mod tests {
   #[test]
   fn snapshot_includes_stack_metadata_when_available() {
     let tracer = Tracer::new();
+
     tracer
       .stack_table()
       .insert_with_id(123, vec![FrameMetadata::new("file.py", "fn", 1)]);
+
     tracer.record_event(AllocationEvent::new(
       EventKind::Allocation,
       0x1,
@@ -673,11 +689,13 @@ mod tests {
     ));
 
     let snapshot = tracer.snapshot();
+
     let record = snapshot
       .records()
       .iter()
       .find(|record| record.stack_id == 123)
       .expect("missing stack 123");
+
     assert!(record.stack.is_some(), "expected stack metadata");
   }
 
@@ -689,6 +707,7 @@ mod tests {
     let snapshot = tracer.snapshot();
     let record = snapshot.records().first().expect("missing allocation");
     let stack = record.stack.as_ref().expect("missing captured stack");
+
     assert!(!stack.frames().is_empty(), "expected captured frames");
   }
 
@@ -698,15 +717,18 @@ mod tests {
       .capture_native(true)
       .python_skip_frames(1)
       .finish();
+
     let frames = vec![
       FrameMetadata::new("internal.py", "wrapper", 1),
       FrameMetadata::new("app.py", "handler", 42),
     ];
+
     tracer.record_allocation_with_frames(0xdead, 24, &frames);
 
     let snapshot = tracer.snapshot();
     let record = snapshot.records().first().expect("missing allocation");
     let stack = record.stack.as_ref().expect("missing captured stack");
+
     assert_eq!(stack.frames()[0].filename.as_ref(), "app.py");
     assert_eq!(stack.frames()[0].function.as_ref(), "handler");
   }
@@ -714,15 +736,19 @@ mod tests {
   #[test]
   fn deallocation_reuses_allocation_stack_id() {
     let tracer = Tracer::builder().capture_native(true).finish();
+
     let address = 0xfeed;
+
     tracer.record_allocation(address, 64);
     tracer.record_deallocation(address, 64);
 
     let snapshot = tracer.snapshot();
+
     let record = snapshot
       .records()
       .first()
       .expect("missing allocation record");
+
     assert_eq!(record.allocations, 1);
     assert_eq!(record.deallocations, 1);
     assert_eq!(record.current_bytes, 0);
@@ -731,11 +757,13 @@ mod tests {
   #[test]
   fn reallocation_moves_pointer_and_updates_counters() {
     let tracer = Tracer::builder().capture_native(false).finish();
+
     tracer.record_allocation(0x1, 32);
     tracer.record_reallocation(0x1, 32, 0x2, 64);
 
     let snapshot = tracer.snapshot();
     let record = snapshot.records().first().expect("missing allocation");
+
     assert_eq!(record.allocations, 2);
     assert_eq!(record.deallocations, 1);
     assert_eq!(record.current_bytes, 64);
@@ -745,12 +773,14 @@ mod tests {
   fn reallocation_with_python_frames_updates_metadata() {
     let tracer = Tracer::builder().capture_native(false).finish();
     tracer.record_allocation(0x1, 16);
+
     let frames = vec![FrameMetadata::new("resize.py", "grow", 99)];
     tracer.record_reallocation_with_frames(0x1, 16, 0x2, 32, &frames);
 
     let snapshot = tracer.snapshot();
     let record = snapshot.records().first().expect("missing allocation");
     let stack = record.stack.as_ref().expect("missing stack metadata");
+
     assert_eq!(stack.frames()[0].filename.as_ref(), "resize.py");
     assert_eq!(record.current_bytes, 32);
   }
@@ -761,6 +791,7 @@ mod tests {
     tracer.record_reallocation(0xbeef, 10, 0xcafe, 20);
 
     let snapshot = tracer.snapshot();
+
     assert_eq!(snapshot.dropped_events(), 2);
     assert!(snapshot.records().is_empty());
   }
@@ -771,6 +802,7 @@ mod tests {
     tracer.record_deallocation(0xbeef, 16);
 
     let snapshot = tracer.snapshot();
+
     assert_eq!(snapshot.dropped_events(), 1);
     assert!(snapshot.records().is_empty());
   }

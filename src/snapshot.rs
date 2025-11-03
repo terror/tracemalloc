@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use crate::{event::StackId, stack::StackMetadata};
+use super::*;
 
 /// A single aggregated entry representing allocations attributed to a stack.
 #[derive(Debug, Clone)]
@@ -86,6 +84,7 @@ impl SnapshotDelta {
 
     let dropped_events_delta =
       i128::from(newer.dropped_events()) - i128::from(older.dropped_events());
+
     let dropped_events = match i64::try_from(dropped_events_delta) {
       Ok(value) => value,
       Err(_) if dropped_events_delta.is_negative() => i64::MIN,

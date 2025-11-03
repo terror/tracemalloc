@@ -1,27 +1,43 @@
-#![deny(clippy::all, clippy::pedantic)]
-#![forbid(unsafe_code)]
-
-//! Core library entry point for the Rust-based tracemalloc reimplementation.
+//! Core library entry point for the Rust-based tracemalloc implementation.
 //!
 //! The goal of this crate is to provide a low-overhead, highly concurrent memory
-//! trace collector that can be surfaced to Python through an FFI layer. The
-//! implementation is intentionally staged: start with a minimal, purely Rust
-//! collector and progressively layer in `CPython` integration and advanced
-//! snapshot/export features.
+//! trace collector that can be surfaced to Python through an FFI layer.
 
-pub mod aggregator;
-pub mod config;
-pub mod event;
-pub mod ring_buffer;
-pub mod snapshot;
-pub mod stack;
+mod aggregator;
+mod config;
+mod event;
+mod ring_buffer;
+mod snapshot;
+mod stack;
 mod stack_capture;
-pub mod state;
+mod state;
 
-pub use aggregator::Aggregator;
-pub use config::TracerConfig;
-pub use event::{AllocationEvent, EventKind, StackId};
-pub use ring_buffer::{DrainAction, ThreadBuffer};
-pub use snapshot::{Snapshot, SnapshotDelta};
-pub use stack::{FrameMetadata, StackMetadata, StackTable};
-pub use state::{Tracer, TracerBuilder};
+use {
+  backtrace::{Frame, SymbolName},
+  crossbeam_queue::ArrayQueue,
+  ring_buffer::ThreadBufferInner,
+  snapshot::SnapshotRecord,
+  stack_capture::StackCollector,
+  std::{
+    cell::RefCell,
+    collections::HashMap,
+    ffi::OsStr,
+    mem::size_of,
+    sync::{
+      Arc, Condvar, Mutex, MutexGuard, Weak,
+      atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+  },
+};
+
+pub use {
+  aggregator::Aggregator,
+  config::TracerConfig,
+  event::{AllocationEvent, EventKind, StackId},
+  ring_buffer::{DrainAction, ThreadBuffer},
+  snapshot::{Snapshot, SnapshotDelta},
+  stack::{FrameMetadata, StackMetadata, StackTable},
+  state::{Tracer, TracerBuilder},
+};

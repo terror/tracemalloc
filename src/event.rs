@@ -1,4 +1,4 @@
-use std::time::Instant;
+use super::*;
 
 /// Unique identifier for an interned stack trace.
 pub type StackId = u64;

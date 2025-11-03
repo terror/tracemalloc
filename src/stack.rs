@@ -1,9 +1,4 @@
-use std::{
-  collections::HashMap,
-  sync::{Arc, Mutex, MutexGuard},
-};
-
-use crate::event::StackId;
+use super::*;
 
 /// Metadata describing a single frame in a stack trace.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -80,12 +75,14 @@ impl StackTable {
     I: Into<Vec<FrameMetadata>>,
   {
     let frames: Vec<FrameMetadata> = frames.into();
+
     let mut inner = self.lock_inner();
 
     let metadata = Arc::new(StackMetadata {
       frames: Arc::from(frames.clone().into_boxed_slice()),
       id: stack_id,
     });
+
     inner.by_frames.insert(frames, stack_id);
     inner.by_id.insert(stack_id, metadata);
 
@@ -100,18 +97,22 @@ impl StackTable {
     I: Into<Vec<FrameMetadata>>,
   {
     let frames: Vec<FrameMetadata> = frames.into();
+
     let mut inner = self.lock_inner();
+
     if let Some(existing) = inner.by_frames.get(&frames).copied() {
       return existing;
     }
 
     let stack_id = inner.next_id;
+
     inner.next_id = inner.next_id.saturating_add(1);
 
     let metadata = Arc::new(StackMetadata {
       frames: Arc::from(frames.clone().into_boxed_slice()),
       id: stack_id,
     });
+
     inner.by_frames.insert(frames, stack_id);
     inner.by_id.insert(stack_id, metadata);
 
@@ -145,22 +146,24 @@ mod tests {
   #[test]
   fn interns_and_reuses_stack_ids() {
     let table = StackTable::new();
+
     let frames = vec![
       FrameMetadata::new("file.py", "func", 10),
       FrameMetadata::new("other.py", "helper", 3),
     ];
-    let first = table.intern(frames.clone());
-    let second = table.intern(frames);
-    assert_eq!(first, second);
+
+    assert_eq!(table.intern(frames.clone()), table.intern(frames));
   }
 
   #[test]
   fn resolves_metadata_for_known_stack() {
     let table = StackTable::new();
+
     let frames = vec![FrameMetadata::new("file.py", "func", 10)];
     let stack_id = table.intern(frames.clone());
 
     let resolved = table.resolve(stack_id).expect("expected stack metadata");
+
     assert_eq!(resolved.id(), stack_id);
     assert_eq!(resolved.frames(), frames.as_slice());
   }
@@ -171,6 +174,7 @@ mod tests {
     table.insert_with_id(42, vec![FrameMetadata::new("file.py", "func", 1)]);
 
     let resolved = table.resolve(42).expect("missing stack 42");
+
     assert_eq!(resolved.id(), 42);
     assert_eq!(resolved.frames()[0].lineno, 1);
   }

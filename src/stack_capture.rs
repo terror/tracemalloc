@@ -1,12 +1,4 @@
-use std::{ffi::OsStr, sync::Arc};
-
-use backtrace::{Frame, SymbolName};
-
-use crate::{
-  config::TracerConfig,
-  event::StackId,
-  stack::{FrameMetadata, StackTable},
-};
+use super::*;
 
 /// Captures stack traces and interns them through the shared stack table.
 #[derive(Debug)]

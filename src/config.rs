@@ -1,4 +1,4 @@
-use std::time::Duration;
+use super::*;
 
 /// Controls how the tracer collects allocation events.
 #[derive(Debug, Clone)]
