@@ -18,6 +18,7 @@ if [[ ! -d "${VENV_DIR}" ]]; then
   "${PYO3_PYTHON}" -m venv "${VENV_DIR}"
 fi
 
+# shellcheck disable=SC1091  # venv activate script is created at runtime
 source "${VENV_DIR}/bin/activate"
 python -m pip install --upgrade pip maturin >/dev/null
 
