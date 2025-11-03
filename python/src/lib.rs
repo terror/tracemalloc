@@ -1,13 +1,15 @@
 use {
   pyo3::{
     Bound, Py,
-    exceptions::PyRuntimeError,
+    exceptions::{PyRuntimeError, PyTypeError},
     ffi,
     ffi::PyMemAllocatorDomain::{
       PYMEM_DOMAIN_MEM, PYMEM_DOMAIN_OBJ, PYMEM_DOMAIN_RAW,
     },
     prelude::*,
-    types::{PyAny, PyDict, PyFrame, PyList, PyModule},
+    types::{
+      PyAny, PyDict, PyFloat, PyFrame, PyInt, PyList, PyModule, PyString,
+    },
   },
   std::{
     cell::Cell,
@@ -15,26 +17,119 @@ use {
     mem::MaybeUninit,
     os::raw::c_void,
     ptr,
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, RwLock},
   },
   tracemalloc::{FrameMetadata, Snapshot, Tracer},
 };
 
-static STATE: OnceLock<Box<ShimState>> = OnceLock::new();
+static STATE: RwLock<Option<Box<ShimState>>> = RwLock::new(None);
 
 thread_local! {
   static IN_TRACER: Cell<bool> = Cell::new(false);
 }
 
+#[derive(Default)]
+struct SamplingOptions {
+  rate: Option<f64>,
+  bytes: Option<u64>,
+}
+
+fn parse_sampling(value: Option<&Bound<'_, PyAny>>) -> PyResult<SamplingOptions> {
+  let mut options = SamplingOptions::default();
+
+  let Some(obj) = value else {
+    return Ok(options);
+  };
+
+  if obj.is_none() {
+    return Ok(options);
+  }
+
+  if let Ok(dict) = obj.downcast::<PyDict>() {
+    if let Some(rate_obj) = dict.get_item("rate")? {
+      options.rate = Some(rate_obj.extract::<f64>()?);
+    }
+
+    if let Some(bytes_obj) = dict.get_item("bytes")? {
+      options.bytes = Some(bytes_obj.extract::<u64>()?);
+    }
+
+    return Ok(options);
+  }
+
+  if obj.is_instance_of::<PyFloat>() {
+    options.rate = Some(obj.extract::<f64>()?);
+    return Ok(options);
+  }
+
+  if obj.is_instance_of::<PyInt>() {
+    options.bytes = Some(obj.extract::<u64>()?);
+    return Ok(options);
+  }
+
+  Err(PyTypeError::new_err(
+    "sampling must be a float probability, integer byte interval, or mapping with 'rate'/'bytes'",
+  ))
+}
+
+fn parse_exporters(exporters: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+  let Some(obj) = exporters else {
+    return Ok(Vec::new());
+  };
+
+  if obj.is_none() {
+    return Ok(Vec::new());
+  }
+
+  if let Ok(py_str) = obj.downcast::<PyString>() {
+    return Ok(vec![py_str.to_string_lossy().into_owned()]);
+  }
+
+  if let Ok(iterator) = obj.iter() {
+    let mut parsed = Vec::new();
+
+    for item in iterator {
+      let value = item?;
+      let py_str = value.downcast::<PyString>().map_err(|_| {
+        PyTypeError::new_err("exporters must be strings or iterables of strings")
+      })?;
+      parsed.push(py_str.to_string_lossy().into_owned());
+    }
+
+    return Ok(parsed);
+  }
+
+  Err(PyTypeError::new_err(
+    "exporters must be a string or iterable of strings",
+  ))
+}
+
 #[pyfunction]
+#[pyo3(signature = (
+  nframe=None,
+  capture_native=None,
+  sampling=None,
+  ring_buffer_bytes=None,
+  exporters=None
+))]
 fn start(
   py: Python<'_>,
   nframe: Option<u16>,
   capture_native: Option<bool>,
+  sampling: Option<Bound<'_, PyAny>>,
+  ring_buffer_bytes: Option<usize>,
+  exporters: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
-  if STATE.get().is_some() {
+  let mut guard = STATE
+    .write()
+    .map_err(|_| PyRuntimeError::new_err("tracer state poisoned"))?;
+
+  if guard.is_some() {
     return Ok(());
   }
+
+  let sampling_options = parse_sampling(sampling.as_ref())?;
+  let exporter_list = parse_exporters(exporters.as_ref())?;
 
   let mut builder = Tracer::builder().start_enabled(true);
 
@@ -48,24 +143,40 @@ fn start(
     builder = builder.capture_native(false);
   }
 
+  if let Some(bytes) = sampling_options.bytes {
+    builder = builder.sampling_bytes(Some(bytes));
+  }
+
+  if sampling_options.bytes.is_none() {
+    if let Some(rate) = sampling_options.rate {
+      builder = builder.sampling_rate(rate);
+    }
+  }
+
+  if let Some(bytes) = ring_buffer_bytes {
+    builder = builder.ring_buffer_bytes(bytes);
+  }
+
   let tracer = builder.finish();
 
-  let mut state = Box::new(ShimState::new(tracer));
+  let mut state = Box::new(ShimState::new(tracer, exporter_list));
 
   unsafe {
     state.install(py)?;
   }
 
-  STATE
-    .set(state)
-    .map_err(|_| PyRuntimeError::new_err("tracer already started"))?;
+  *guard = Some(state);
 
   Ok(())
 }
 
 #[pyfunction]
 fn stop(_py: Python<'_>) -> PyResult<()> {
-  if let Some(state) = STATE.get() {
+  let mut guard = STATE
+    .write()
+    .map_err(|_| PyRuntimeError::new_err("tracer state poisoned"))?;
+
+  if let Some(state) = guard.take() {
     unsafe {
       state.restore()?;
     }
@@ -80,15 +191,20 @@ fn stop(_py: Python<'_>) -> PyResult<()> {
 #[pyfunction]
 fn is_tracing() -> bool {
   STATE
-    .get()
-    .map(|state| state.tracer.enabled())
+    .read()
+    .ok()
+    .and_then(|guard| guard.as_ref().map(|state| state.tracer.enabled()))
     .unwrap_or(false)
 }
 
 #[pyfunction]
 fn take_snapshot(py: Python<'_>) -> PyResult<PyObject> {
-  let state = STATE
-    .get()
+  let guard = STATE
+    .read()
+    .map_err(|_| PyRuntimeError::new_err("tracer state poisoned"))?;
+
+  let state = guard
+    .as_ref()
     .ok_or_else(|| PyRuntimeError::new_err("tracer not started"))?;
 
   let snapshot = state.tracer.snapshot();
@@ -149,13 +265,14 @@ struct ShimState {
   frame_skip: usize,
   allocations: Mutex<HashMap<usize, usize>>,
   contexts: [AllocatorContext; 3],
+  _exporters: Vec<String>,
 }
 
 unsafe impl Send for ShimState {}
 unsafe impl Sync for ShimState {}
 
 impl ShimState {
-  fn new(tracer: Tracer) -> Self {
+  fn new(tracer: Tracer, exporters: Vec<String>) -> Self {
     let config = tracer.config().clone();
 
     let frame_depth = usize::from(config.max_stack_depth.max(1));
@@ -170,6 +287,7 @@ impl ShimState {
         AllocatorContext::new(PYMEM_DOMAIN_MEM),
         AllocatorContext::new(PYMEM_DOMAIN_OBJ),
       ],
+      _exporters: exporters,
     }
   }
 
@@ -603,7 +721,7 @@ mod tests {
     pyo3::prepare_freethreaded_python();
 
     let tracer = Tracer::builder().capture_native(false).finish();
-    let state = ShimState::new(tracer);
+    let state = ShimState::new(tracer, Vec::new());
     let frames = state.collect_python_frames();
 
     assert!(
@@ -617,7 +735,7 @@ mod tests {
     pyo3::prepare_freethreaded_python();
 
     let tracer = Tracer::builder().capture_native(false).finish();
-    let state = ShimState::new(tracer.clone());
+    let state = ShimState::new(tracer.clone(), Vec::new());
 
     let old_ptr = 0x1000usize;
     let new_ptr = 0x2000usize;

@@ -185,6 +185,18 @@ impl TracerBuilder {
   }
 
   #[must_use]
+  pub fn ring_buffer_bytes(mut self, bytes: usize) -> Self {
+    self.config.ring_buffer_bytes = bytes.max(1);
+    self
+  }
+
+  #[must_use]
+  pub fn sampling_bytes(mut self, bytes: Option<u64>) -> Self {
+    self.config.sampling_bytes = bytes;
+    self
+  }
+
+  #[must_use]
   pub fn sampling_rate(mut self, rate: f64) -> Self {
     self.config.sampling_rate = rate.clamp(0.0, 1.0);
     self
