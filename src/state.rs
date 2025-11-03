@@ -1,5 +1,6 @@
 use std::{
   cell::RefCell,
+  collections::HashMap,
   sync::{
     Arc, Condvar, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
@@ -10,10 +11,11 @@ use std::{
 use crate::{
   aggregator::Aggregator,
   config::TracerConfig,
-  event::{AllocationEvent, EventKind},
+  event::{AllocationEvent, EventKind, StackId},
   ring_buffer::{DrainAction, ThreadBuffer, ThreadBufferInner},
   snapshot::Snapshot,
   stack::StackTable,
+  stack_capture::StackCollector,
 };
 
 thread_local! {
@@ -79,10 +81,12 @@ impl TracerBuilder {
 #[derive(Debug)]
 struct TracerInner {
   aggregator: Mutex<Aggregator>,
+  allocation_index: Mutex<HashMap<usize, StackId>>,
   buffers: Mutex<Vec<Weak<ThreadBufferInner>>>,
   config: TracerConfig,
   enabled: AtomicBool,
   pending_flush: AtomicBool,
+  stack_collector: StackCollector,
   stack_table: Arc<StackTable>,
   stop_flag: AtomicBool,
   worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
@@ -115,11 +119,6 @@ impl Tracer {
     &self.inner.config
   }
 
-  #[must_use]
-  pub fn stack_table(&self) -> Arc<StackTable> {
-    Arc::clone(&self.inner.stack_table)
-  }
-
   pub fn disable(&self) {
     self.inner.enabled.store(false, Ordering::Release);
   }
@@ -133,9 +132,53 @@ impl Tracer {
     self.inner.enabled.load(Ordering::Acquire)
   }
 
+  fn enqueue_event(&self, event: AllocationEvent) {
+    let buffer = self.thread_buffer();
+    if let DrainAction::FlushPending = buffer.record(event) {
+      self.inner.notify_flush();
+    }
+  }
+
   #[must_use]
   pub fn new() -> Self {
     Self::with_config(TracerConfig::default())
+  }
+
+  /// Fast-path helper that captures the current stack trace and records an
+  /// allocation event keyed by the interned stack identifier.
+  pub fn record_allocation(&self, address: usize, size: usize) {
+    if !self.enabled() {
+      return;
+    }
+
+    if let Some(event) =
+      self
+        .inner
+        .prepare_hot_event(EventKind::Allocation, address, size)
+    {
+      self.enqueue_event(event);
+    }
+  }
+
+  /// Fast-path helper that updates aggregated statistics for a released
+  /// allocation using the previously recorded stack identifier.
+  pub fn record_deallocation(&self, address: usize, size: usize) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self
+      .inner
+      .prepare_hot_event(EventKind::Deallocation, address, size)
+    {
+      Some(event) => self.enqueue_event(event),
+      None => self.record_dropped_event(1),
+    }
+  }
+
+  fn record_dropped_event(&self, count: u64) {
+    let dropped = AllocationEvent::new(EventKind::Dropped { count }, 0, 0, 0);
+    self.enqueue_event(dropped);
   }
 
   /// Feed a pre-built event directly into the per-thread buffer. A background worker
@@ -145,16 +188,16 @@ impl Tracer {
       return;
     }
 
-    let buffer = self.thread_buffer();
-    if let DrainAction::FlushPending = buffer.record(event) {
-      self.inner.notify_flush();
-    }
+    self.enqueue_event(event);
   }
 
   pub fn reset(&self) {
     self.inner.drain_buffers();
     if let Ok(mut aggregator) = self.inner.aggregator.lock() {
       aggregator.reset();
+    }
+    if let Ok(mut allocations) = self.inner.allocation_index.lock() {
+      allocations.clear();
     }
   }
 
@@ -168,6 +211,11 @@ impl Tracer {
     self.inner.drain_buffers();
     let guard = self.inner.aggregator.lock().expect("aggregator poisoned");
     guard.snapshot()
+  }
+
+  #[must_use]
+  pub fn stack_table(&self) -> Arc<StackTable> {
+    Arc::clone(&self.inner.stack_table)
   }
 
   fn thread_buffer(&self) -> ThreadBuffer {
@@ -254,12 +302,16 @@ impl TracerInner {
   fn new(config: TracerConfig) -> Self {
     let enabled = AtomicBool::new(config.start_enabled);
     let stack_table = Arc::new(StackTable::new());
+    let stack_collector =
+      StackCollector::new(Arc::clone(&stack_table), &config);
     Self {
       aggregator: Mutex::new(Aggregator::new(Arc::clone(&stack_table))),
+      allocation_index: Mutex::new(HashMap::new()),
       buffers: Mutex::new(Vec::new()),
       config,
       enabled,
       pending_flush: AtomicBool::new(false),
+      stack_collector,
       stack_table,
       stop_flag: AtomicBool::new(false),
       worker_handle: Mutex::new(None),
@@ -270,6 +322,34 @@ impl TracerInner {
   fn notify_flush(&self) {
     if !self.pending_flush.swap(true, Ordering::AcqRel) {
       self.worker_sync.condvar.notify_one();
+    }
+  }
+
+  fn prepare_hot_event(
+    &self,
+    kind: EventKind,
+    address: usize,
+    size: usize,
+  ) -> Option<AllocationEvent> {
+    match kind {
+      EventKind::Allocation => {
+        let stack_id = self.stack_collector.capture_and_intern();
+        let mut index = match self.allocation_index.lock() {
+          Ok(guard) => guard,
+          Err(err) => err.into_inner(),
+        };
+        index.insert(address, stack_id);
+        Some(AllocationEvent::new(kind, address, size, stack_id))
+      }
+      EventKind::Deallocation => {
+        let mut index = match self.allocation_index.lock() {
+          Ok(guard) => guard,
+          Err(err) => err.into_inner(),
+        };
+        let stack_id = index.remove(&address)?;
+        Some(AllocationEvent::new(kind, address, size, stack_id))
+      }
+      EventKind::Dropped { .. } => None,
     }
   }
 
@@ -424,5 +504,43 @@ mod tests {
       .find(|record| record.stack_id == 123)
       .expect("missing stack 123");
     assert!(record.stack.is_some(), "expected stack metadata");
+  }
+
+  #[test]
+  fn hot_path_stack_capture_produces_metadata() {
+    let tracer = Tracer::builder().capture_native(true).finish();
+    tracer.record_allocation(0x1, 32);
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot.records().first().expect("missing allocation");
+    let stack = record.stack.as_ref().expect("missing captured stack");
+    assert!(!stack.frames().is_empty(), "expected captured frames");
+  }
+
+  #[test]
+  fn deallocation_reuses_allocation_stack_id() {
+    let tracer = Tracer::builder().capture_native(true).finish();
+    let address = 0xfeed;
+    tracer.record_allocation(address, 64);
+    tracer.record_deallocation(address, 64);
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot
+      .records()
+      .first()
+      .expect("missing allocation record");
+    assert_eq!(record.allocations, 1);
+    assert_eq!(record.deallocations, 1);
+    assert_eq!(record.current_bytes, 0);
+  }
+
+  #[test]
+  fn unknown_deallocation_counts_as_dropped() {
+    let tracer = Tracer::new();
+    tracer.record_deallocation(0xbeef, 16);
+
+    let snapshot = tracer.snapshot();
+    assert_eq!(snapshot.dropped_events(), 1);
+    assert!(snapshot.records().is_empty());
   }
 }

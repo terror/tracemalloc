@@ -71,15 +71,26 @@ pub struct StackTable {
 }
 
 impl StackTable {
-  #[must_use]
-  pub fn new() -> Self {
-    Self::default()
-  }
+  /// Explicitly associate metadata with a stack identifier.
+  ///
+  /// This helper is primarily intended for tests and for plumbing pre-existing
+  /// stack identifiers gathered outside of the Rust tracer.
+  pub fn insert_with_id<I>(&self, stack_id: StackId, frames: I)
+  where
+    I: Into<Vec<FrameMetadata>>,
+  {
+    let frames: Vec<FrameMetadata> = frames.into();
+    let mut inner = self.lock_inner();
 
-  fn lock_inner(&self) -> MutexGuard<'_, StackTableInner> {
-    match self.inner.lock() {
-      Ok(guard) => guard,
-      Err(err) => err.into_inner(),
+    let metadata = Arc::new(StackMetadata {
+      frames: Arc::from(frames.clone().into_boxed_slice()),
+      id: stack_id,
+    });
+    inner.by_frames.insert(frames, stack_id);
+    inner.by_id.insert(stack_id, metadata);
+
+    if inner.next_id <= stack_id {
+      inner.next_id = stack_id.saturating_add(1);
     }
   }
 
@@ -107,27 +118,16 @@ impl StackTable {
     stack_id
   }
 
-  /// Explicitly associate metadata with a stack identifier.
-  ///
-  /// This helper is primarily intended for tests and for plumbing pre-existing
-  /// stack identifiers gathered outside of the Rust tracer.
-  pub fn insert_with_id<I>(&self, stack_id: StackId, frames: I)
-  where
-    I: Into<Vec<FrameMetadata>>,
-  {
-    let frames: Vec<FrameMetadata> = frames.into();
-    let mut inner = self.lock_inner();
-
-    let metadata = Arc::new(StackMetadata {
-      frames: Arc::from(frames.clone().into_boxed_slice()),
-      id: stack_id,
-    });
-    inner.by_frames.insert(frames, stack_id);
-    inner.by_id.insert(stack_id, metadata);
-
-    if inner.next_id <= stack_id {
-      inner.next_id = stack_id.saturating_add(1);
+  fn lock_inner(&self) -> MutexGuard<'_, StackTableInner> {
+    match self.inner.lock() {
+      Ok(guard) => guard,
+      Err(err) => err.into_inner(),
     }
+  }
+
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
   }
 
   /// Resolve a stack identifier back into its metadata, if known.

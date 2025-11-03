@@ -1,19 +1,10 @@
-use tracemalloc::{AllocationEvent, EventKind, FrameMetadata, Tracer};
+use tracemalloc::Tracer;
 
 fn main() {
   let tracer = Tracer::new();
-  tracer
-    .stack_table()
-    .insert_with_id(1, vec![FrameMetadata::new("demo.py", "main", 1)]);
-
-  tracer.record_event(AllocationEvent::new(EventKind::Allocation, 0x1, 128, 1));
-  tracer.record_event(AllocationEvent::new(EventKind::Allocation, 0x2, 64, 1));
-  tracer.record_event(AllocationEvent::new(
-    EventKind::Deallocation,
-    0x2,
-    64,
-    1,
-  ));
+  tracer.record_allocation(0x1, 128);
+  tracer.record_allocation(0x2, 64);
+  tracer.record_deallocation(0x2, 64);
 
   let snapshot = tracer.snapshot();
 

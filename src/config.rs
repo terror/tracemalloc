@@ -22,7 +22,7 @@ pub struct TracerConfig {
 impl Default for TracerConfig {
   fn default() -> Self {
     Self {
-      capture_native: false,
+      capture_native: true,
       drain_interval: Duration::from_millis(25),
       max_stack_depth: 1,
       ring_buffer_bytes: 256 * 1024,

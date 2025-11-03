@@ -15,6 +15,7 @@ pub mod event;
 pub mod ring_buffer;
 pub mod snapshot;
 pub mod stack;
+mod stack_capture;
 pub mod state;
 
 pub use aggregator::Aggregator;

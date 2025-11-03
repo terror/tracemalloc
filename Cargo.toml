@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossbeam-queue = "0.3"
+backtrace = { version = "0.3", default-features = false, features = ["std"] }
 
 [lints.rust]
 mismatched_lifetime_syntaxes = "allow"
