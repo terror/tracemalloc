@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::event::{AllocationEvent, EventKind, StackId};
 use crate::snapshot::{Snapshot, SnapshotRecord};
+use crate::stack::StackTable;
 
 #[derive(Debug, Default, Clone)]
 pub struct AllocationStats {
@@ -27,9 +28,10 @@ impl AllocationStats {
 }
 
 /// Aggregates allocation events keyed by stack identifier.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Aggregator {
   dropped_events: u64,
+  stack_table: Arc<StackTable>,
   stats: HashMap<StackId, AllocationStats>,
 }
 
@@ -71,8 +73,12 @@ impl Aggregator {
   }
 
   #[must_use]
-  pub fn new() -> Self {
-    Self::default()
+  pub fn new(stack_table: Arc<StackTable>) -> Self {
+    Self {
+      dropped_events: 0,
+      stack_table,
+      stats: HashMap::new(),
+    }
   }
 
   /// Clears all aggregated statistics.
@@ -91,6 +97,7 @@ impl Aggregator {
         allocations: stats.allocations,
         current_bytes: stats.current_bytes,
         deallocations: stats.deallocations,
+        stack: self.stack_table.resolve(*stack_id),
         stack_id: *stack_id,
         total_allocated: stats.total_allocated,
         total_freed: stats.total_freed,
@@ -113,10 +120,13 @@ fn convert_size(size: usize) -> Option<(i64, u64)> {
 mod tests {
   use super::*;
   use crate::event::EventKind;
+  use crate::stack::{FrameMetadata, StackTable};
+  use std::sync::Arc;
 
   #[test]
   fn aggregates_allocations_and_deallocations() {
-    let mut aggregator = Aggregator::new();
+    let stack_table = Arc::new(StackTable::new());
+    let mut aggregator = Aggregator::new(Arc::clone(&stack_table));
     aggregator.ingest(vec![
       AllocationEvent::new(EventKind::Allocation, 0x1, 128, 42),
       AllocationEvent::new(EventKind::Allocation, 0x2, 64, 42),
@@ -139,7 +149,8 @@ mod tests {
 
   #[test]
   fn tracks_dropped_events() {
-    let mut aggregator = Aggregator::new();
+    let stack_table = Arc::new(StackTable::new());
+    let mut aggregator = Aggregator::new(stack_table);
     aggregator.ingest(vec![AllocationEvent::new(
       EventKind::Dropped { count: 5 },
       0,
@@ -149,5 +160,26 @@ mod tests {
 
     let snapshot = aggregator.snapshot();
     assert_eq!(snapshot.dropped_events(), 5);
+  }
+
+  #[test]
+  fn resolves_stack_metadata_in_snapshot() {
+    let stack_table = Arc::new(StackTable::new());
+    stack_table
+      .insert_with_id(7, vec![FrameMetadata::new("main.py", "<module>", 1)]);
+    let mut aggregator = Aggregator::new(stack_table);
+    aggregator.ingest(vec![AllocationEvent::new(
+      EventKind::Allocation,
+      0x1,
+      16,
+      7,
+    )]);
+
+    let snapshot = aggregator.snapshot();
+    let record = snapshot.records().first().expect("missing record");
+    let stack = record.stack.as_ref().expect("missing stack metadata");
+    assert_eq!(stack.id(), 7);
+    assert_eq!(stack.frames().len(), 1);
+    assert_eq!(stack.frames()[0].filename.as_ref(), "main.py");
   }
 }

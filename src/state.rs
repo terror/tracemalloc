@@ -13,6 +13,7 @@ use crate::{
   event::{AllocationEvent, EventKind},
   ring_buffer::{DrainAction, ThreadBuffer, ThreadBufferInner},
   snapshot::Snapshot,
+  stack::StackTable,
 };
 
 thread_local! {
@@ -82,6 +83,7 @@ struct TracerInner {
   config: TracerConfig,
   enabled: AtomicBool,
   pending_flush: AtomicBool,
+  stack_table: Arc<StackTable>,
   stop_flag: AtomicBool,
   worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
   worker_sync: WorkerSync,
@@ -111,6 +113,11 @@ impl Tracer {
   #[must_use]
   pub fn config(&self) -> &TracerConfig {
     &self.inner.config
+  }
+
+  #[must_use]
+  pub fn stack_table(&self) -> Arc<StackTable> {
+    Arc::clone(&self.inner.stack_table)
   }
 
   pub fn disable(&self) {
@@ -246,12 +253,14 @@ impl TracerInner {
 
   fn new(config: TracerConfig) -> Self {
     let enabled = AtomicBool::new(config.start_enabled);
+    let stack_table = Arc::new(StackTable::new());
     Self {
-      aggregator: Mutex::new(Aggregator::new()),
+      aggregator: Mutex::new(Aggregator::new(Arc::clone(&stack_table))),
       buffers: Mutex::new(Vec::new()),
       config,
       enabled,
       pending_flush: AtomicBool::new(false),
+      stack_table,
       stop_flag: AtomicBool::new(false),
       worker_handle: Mutex::new(None),
       worker_sync: WorkerSync::new(),
@@ -346,6 +355,7 @@ impl Drop for TracerInner {
 mod tests {
   use super::*;
   use crate::event::{AllocationEvent, EventKind};
+  use crate::stack::FrameMetadata;
 
   #[test]
   fn disabled_tracer_drops_events() {
@@ -392,5 +402,27 @@ mod tests {
         .any(|record| record.stack_id == 99),
       "expected stack 99 in snapshot"
     );
+  }
+
+  #[test]
+  fn snapshot_includes_stack_metadata_when_available() {
+    let tracer = Tracer::new();
+    tracer
+      .stack_table()
+      .insert_with_id(123, vec![FrameMetadata::new("file.py", "fn", 1)]);
+    tracer.record_event(AllocationEvent::new(
+      EventKind::Allocation,
+      0x1,
+      8,
+      123,
+    ));
+
+    let snapshot = tracer.snapshot();
+    let record = snapshot
+      .records()
+      .iter()
+      .find(|record| record.stack_id == 123)
+      .expect("missing stack 123");
+    assert!(record.stack.is_some(), "expected stack metadata");
   }
 }

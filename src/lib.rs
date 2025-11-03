@@ -14,6 +14,7 @@ pub mod config;
 pub mod event;
 pub mod ring_buffer;
 pub mod snapshot;
+pub mod stack;
 pub mod state;
 
 pub use aggregator::Aggregator;
@@ -21,4 +22,5 @@ pub use config::TracerConfig;
 pub use event::{AllocationEvent, EventKind, StackId};
 pub use ring_buffer::{DrainAction, ThreadBuffer};
 pub use snapshot::{Snapshot, SnapshotDelta};
+pub use stack::{FrameMetadata, StackMetadata, StackTable};
 pub use state::{Tracer, TracerBuilder};

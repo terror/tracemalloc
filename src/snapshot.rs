@@ -1,4 +1,6 @@
-use crate::event::StackId;
+use std::sync::Arc;
+
+use crate::{event::StackId, stack::StackMetadata};
 
 /// A single aggregated entry representing allocations attributed to a stack.
 #[derive(Debug, Clone)]
@@ -6,6 +8,7 @@ pub struct SnapshotRecord {
   pub allocations: u64,
   pub current_bytes: i64,
   pub deallocations: u64,
+  pub stack: Option<Arc<StackMetadata>>,
   pub stack_id: StackId,
   pub total_allocated: u64,
   pub total_freed: u64,
@@ -68,6 +71,7 @@ impl SnapshotDelta {
           deallocations: record
             .deallocations
             .saturating_sub(prev.deallocations),
+          stack: record.stack.clone(),
           stack_id: record.stack_id,
           total_allocated: record
             .total_allocated
