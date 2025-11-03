@@ -6,8 +6,8 @@ pub type StackId = u64;
 /// Work-in-progress encoding of allocation events drained from per-thread buffers.
 #[derive(Debug, Clone)]
 pub struct AllocationEvent {
-  pub kind: EventKind,
   pub address: usize,
+  pub kind: EventKind,
   pub size: usize,
   pub stack_id: StackId,
   pub timestamp: Instant,
@@ -37,6 +37,6 @@ pub enum EventKind {
   Deallocation,
   /// Signifies that the tracer dropped one or more events due to back pressure.
   Dropped {
-    count: u32,
+    count: u64,
   },
 }

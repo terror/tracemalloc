@@ -3,10 +3,10 @@ use crate::event::StackId;
 /// A single aggregated entry representing allocations attributed to a stack.
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
-  pub stack_id: StackId,
-  pub current_bytes: i64,
   pub allocations: u64,
+  pub current_bytes: i64,
   pub deallocations: u64,
+  pub stack_id: StackId,
   pub total_allocated: u64,
   pub total_freed: u64,
 }
@@ -14,16 +14,21 @@ pub struct SnapshotRecord {
 /// Immutable view of the current tracer state.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-  records: Vec<SnapshotRecord>,
   dropped_events: u64,
+  records: Vec<SnapshotRecord>,
 }
 
 impl Snapshot {
   #[must_use]
+  pub fn dropped_events(&self) -> u64 {
+    self.dropped_events
+  }
+
+  #[must_use]
   pub(crate) fn new(records: Vec<SnapshotRecord>, dropped_events: u64) -> Self {
     Self {
-      records,
       dropped_events,
+      records,
     }
   }
 
@@ -31,27 +36,19 @@ impl Snapshot {
   pub fn records(&self) -> &[SnapshotRecord] {
     &self.records
   }
-
-  #[must_use]
-  pub fn dropped_events(&self) -> u64 {
-    self.dropped_events
-  }
 }
 
 /// Lightweight diff between two snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotDelta {
-  records: Vec<SnapshotRecord>,
   dropped_events: i64,
+  records: Vec<SnapshotRecord>,
 }
 
 impl SnapshotDelta {
   #[must_use]
-  pub fn new(records: Vec<SnapshotRecord>, dropped_events: i64) -> Self {
-    Self {
-      records,
-      dropped_events,
-    }
+  pub fn dropped_events(&self) -> i64 {
+    self.dropped_events
   }
 
   #[must_use]
@@ -66,12 +63,12 @@ impl SnapshotDelta {
 
       let delta_record = match baseline {
         Some(prev) => SnapshotRecord {
-          stack_id: record.stack_id,
-          current_bytes: record.current_bytes - prev.current_bytes,
           allocations: record.allocations.saturating_sub(prev.allocations),
+          current_bytes: record.current_bytes - prev.current_bytes,
           deallocations: record
             .deallocations
             .saturating_sub(prev.deallocations),
+          stack_id: record.stack_id,
           total_allocated: record
             .total_allocated
             .saturating_sub(prev.total_allocated),
@@ -83,19 +80,27 @@ impl SnapshotDelta {
       deltas.push(delta_record);
     }
 
-    let dropped_events =
-      newer.dropped_events() as i64 - older.dropped_events() as i64;
+    let dropped_events_delta =
+      i128::from(newer.dropped_events()) - i128::from(older.dropped_events());
+    let dropped_events = match i64::try_from(dropped_events_delta) {
+      Ok(value) => value,
+      Err(_) if dropped_events_delta.is_negative() => i64::MIN,
+      Err(_) => i64::MAX,
+    };
 
     Self::new(deltas, dropped_events)
   }
 
   #[must_use]
-  pub fn records(&self) -> &[SnapshotRecord] {
-    &self.records
+  pub fn new(records: Vec<SnapshotRecord>, dropped_events: i64) -> Self {
+    Self {
+      dropped_events,
+      records,
+    }
   }
 
   #[must_use]
-  pub fn dropped_events(&self) -> i64 {
-    self.dropped_events
+  pub fn records(&self) -> &[SnapshotRecord] {
+    &self.records
   }
 }

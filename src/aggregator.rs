@@ -5,42 +5,35 @@ use crate::snapshot::{Snapshot, SnapshotRecord};
 
 #[derive(Debug, Default, Clone)]
 pub struct AllocationStats {
-  pub current_bytes: i64,
   pub allocations: u64,
+  pub current_bytes: i64,
   pub deallocations: u64,
   pub total_allocated: u64,
   pub total_freed: u64,
 }
 
 impl AllocationStats {
-  fn on_allocation(&mut self, size: usize) {
-    let size = size as i64;
-    self.current_bytes += size;
-    self.allocations += 1;
-    self.total_allocated += size as u64;
+  fn on_allocation(&mut self, size_signed: i64, size_unsigned: u64) {
+    self.current_bytes = self.current_bytes.saturating_add(size_signed);
+    self.allocations = self.allocations.saturating_add(1);
+    self.total_allocated = self.total_allocated.saturating_add(size_unsigned);
   }
 
-  fn on_deallocation(&mut self, size: usize) {
-    let size = size as i64;
-    self.current_bytes -= size;
-    self.deallocations += 1;
-    self.total_freed += size as u64;
+  fn on_deallocation(&mut self, size_signed: i64, size_unsigned: u64) {
+    self.current_bytes = self.current_bytes.saturating_sub(size_signed);
+    self.deallocations = self.deallocations.saturating_add(1);
+    self.total_freed = self.total_freed.saturating_add(size_unsigned);
   }
 }
 
 /// Aggregates allocation events keyed by stack identifier.
 #[derive(Debug, Default)]
 pub struct Aggregator {
-  stats: HashMap<StackId, AllocationStats>,
   dropped_events: u64,
+  stats: HashMap<StackId, AllocationStats>,
 }
 
 impl Aggregator {
-  #[must_use]
-  pub fn new() -> Self {
-    Self::default()
-  }
-
   /// Update the aggregate statistics based on a stream of events.
   pub fn ingest<I>(&mut self, events: I)
   where
@@ -49,24 +42,43 @@ impl Aggregator {
     for event in events {
       match event.kind {
         EventKind::Allocation => {
-          self
-            .stats
-            .entry(event.stack_id)
-            .or_default()
-            .on_allocation(event.size);
+          if let Some((size_signed, size_unsigned)) = convert_size(event.size) {
+            self
+              .stats
+              .entry(event.stack_id)
+              .or_default()
+              .on_allocation(size_signed, size_unsigned);
+          } else {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+          }
         }
         EventKind::Deallocation => {
-          self
-            .stats
-            .entry(event.stack_id)
-            .or_default()
-            .on_deallocation(event.size);
+          if let Some((size_signed, size_unsigned)) = convert_size(event.size) {
+            self
+              .stats
+              .entry(event.stack_id)
+              .or_default()
+              .on_deallocation(size_signed, size_unsigned);
+          } else {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+          }
         }
         EventKind::Dropped { count } => {
-          self.dropped_events += u64::from(count);
+          self.dropped_events = self.dropped_events.saturating_add(count);
         }
       }
     }
+  }
+
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Clears all aggregated statistics.
+  pub fn reset(&mut self) {
+    self.stats.clear();
+    self.dropped_events = 0;
   }
 
   /// Produce a snapshot that callers can later diff.
@@ -76,10 +88,10 @@ impl Aggregator {
       .stats
       .iter()
       .map(|(stack_id, stats)| SnapshotRecord {
-        stack_id: *stack_id,
-        current_bytes: stats.current_bytes,
         allocations: stats.allocations,
+        current_bytes: stats.current_bytes,
         deallocations: stats.deallocations,
+        stack_id: *stack_id,
         total_allocated: stats.total_allocated,
         total_freed: stats.total_freed,
       })
@@ -89,12 +101,12 @@ impl Aggregator {
 
     Snapshot::new(records, self.dropped_events)
   }
+}
 
-  /// Clears all aggregated statistics.
-  pub fn reset(&mut self) {
-    self.stats.clear();
-    self.dropped_events = 0;
-  }
+fn convert_size(size: usize) -> Option<(i64, u64)> {
+  let size_signed = i64::try_from(size).ok()?;
+  let size_unsigned = u64::try_from(size).ok()?;
+  Some((size_signed, size_unsigned))
 }
 
 #[cfg(test)]

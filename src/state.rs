@@ -1,12 +1,29 @@
-use std::sync::{
-  Arc, Mutex,
-  atomic::{AtomicBool, Ordering},
+use std::{
+  cell::RefCell,
+  sync::{
+    Arc, Condvar, Mutex, Weak,
+    atomic::{AtomicBool, Ordering},
+  },
+  thread,
 };
 
-use crate::aggregator::Aggregator;
-use crate::config::TracerConfig;
-use crate::event::AllocationEvent;
-use crate::snapshot::Snapshot;
+use crate::{
+  aggregator::Aggregator,
+  config::TracerConfig,
+  event::{AllocationEvent, EventKind},
+  ring_buffer::{DrainAction, ThreadBuffer, ThreadBufferInner},
+  snapshot::Snapshot,
+};
+
+thread_local! {
+  static THREAD_BUFFERS: RefCell<Vec<ThreadLocalBuffer>> =
+    const { RefCell::new(Vec::new()) };
+}
+
+struct ThreadLocalBuffer {
+  buffer: ThreadBuffer,
+  tracer_id: usize,
+}
 
 /// Thin builder that customizes `TracerConfig` without exposing all knobs up front.
 #[derive(Debug, Default)]
@@ -16,16 +33,14 @@ pub struct TracerBuilder {
 
 impl TracerBuilder {
   #[must_use]
-  pub fn new() -> Self {
-    Self {
-      config: TracerConfig::default(),
-    }
+  pub fn capture_native(mut self, capture: bool) -> Self {
+    self.config.capture_native = capture;
+    self
   }
 
   #[must_use]
-  pub fn with_config(mut self, config: TracerConfig) -> Self {
-    self.config = config;
-    self
+  pub fn finish(self) -> Tracer {
+    Tracer::with_config(self.config)
   }
 
   #[must_use]
@@ -35,14 +50,15 @@ impl TracerBuilder {
   }
 
   #[must_use]
-  pub fn sampling_rate(mut self, rate: f64) -> Self {
-    self.config.sampling_rate = rate.clamp(0.0, 1.0);
-    self
+  pub fn new() -> Self {
+    Self {
+      config: TracerConfig::default(),
+    }
   }
 
   #[must_use]
-  pub fn capture_native(mut self, capture: bool) -> Self {
-    self.config.capture_native = capture;
+  pub fn sampling_rate(mut self, rate: f64) -> Self {
+    self.config.sampling_rate = rate.clamp(0.0, 1.0);
     self
   }
 
@@ -53,49 +69,40 @@ impl TracerBuilder {
   }
 
   #[must_use]
-  pub fn finish(self) -> Tracer {
-    Tracer::with_config(self.config)
+  pub fn with_config(mut self, config: TracerConfig) -> Self {
+    self.config = config;
+    self
   }
 }
 
 #[derive(Debug)]
 struct TracerInner {
+  aggregator: Mutex<Aggregator>,
+  buffers: Mutex<Vec<Weak<ThreadBufferInner>>>,
   config: TracerConfig,
   enabled: AtomicBool,
-  aggregator: Mutex<Aggregator>,
+  pending_flush: AtomicBool,
+  stop_flag: AtomicBool,
+  worker_handle: Mutex<Option<thread::JoinHandle<()>>>,
+  worker_sync: WorkerSync,
 }
 
 /// Entry point for recording allocation events and producing snapshots.
 ///
-/// The first milestone keeps the implementation straightforward: events recorded
-/// through `record_event` are applied directly to the in-process aggregator.
-/// Subsequent milestones will introduce per-thread buffers, background drainers,
-/// and a Python-facing FFI surface.
+/// The fast path records allocation events into per-thread lock-free buffers that a
+/// background worker drains into the global aggregator.
 #[derive(Clone, Debug)]
 pub struct Tracer {
   inner: Arc<TracerInner>,
 }
 
+impl Default for Tracer {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl Tracer {
-  #[must_use]
-  pub fn new() -> Self {
-    Self::with_config(TracerConfig::default())
-  }
-
-  #[must_use]
-  pub fn with_config(config: TracerConfig) -> Self {
-    let enabled = AtomicBool::new(config.start_enabled);
-    let inner = TracerInner {
-      config,
-      enabled,
-      aggregator: Mutex::new(Aggregator::new()),
-    };
-
-    Self {
-      inner: Arc::new(inner),
-    }
-  }
-
   #[must_use]
   pub fn builder() -> TracerBuilder {
     TracerBuilder::new()
@@ -106,12 +113,12 @@ impl Tracer {
     &self.inner.config
   }
 
-  pub fn enable(&self) {
-    self.inner.enabled.store(true, Ordering::Release);
-  }
-
   pub fn disable(&self) {
     self.inner.enabled.store(false, Ordering::Release);
+  }
+
+  pub fn enable(&self) {
+    self.inner.enabled.store(true, Ordering::Release);
   }
 
   #[must_use]
@@ -119,29 +126,219 @@ impl Tracer {
     self.inner.enabled.load(Ordering::Acquire)
   }
 
-  /// Feed a pre-built event directly into the aggregator.
-  ///
-  /// This is primarily used for early unit tests before the hot path is wired up.
+  #[must_use]
+  pub fn new() -> Self {
+    Self::with_config(TracerConfig::default())
+  }
+
+  /// Feed a pre-built event directly into the per-thread buffer. A background worker
+  /// will eventually drain it into the aggregator.
   pub fn record_event(&self, event: AllocationEvent) {
     if !self.enabled() {
       return;
     }
 
-    if let Ok(mut aggregator) = self.inner.aggregator.lock() {
-      aggregator.ingest(std::iter::once(event));
+    let buffer = self.thread_buffer();
+    if let DrainAction::FlushPending = buffer.record(event) {
+      self.inner.notify_flush();
     }
   }
 
+  pub fn reset(&self) {
+    self.inner.drain_buffers();
+    if let Ok(mut aggregator) = self.inner.aggregator.lock() {
+      aggregator.reset();
+    }
+  }
+
+  /// Produce a point-in-time snapshot of the aggregated allocations.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the internal aggregator mutex is poisoned.
   #[must_use]
   pub fn snapshot(&self) -> Snapshot {
+    self.inner.drain_buffers();
     let guard = self.inner.aggregator.lock().expect("aggregator poisoned");
     guard.snapshot()
   }
 
-  pub fn reset(&self) {
-    if let Ok(mut aggregator) = self.inner.aggregator.lock() {
-      aggregator.reset();
+  fn thread_buffer(&self) -> ThreadBuffer {
+    let tracer_id = Arc::as_ptr(&self.inner) as usize;
+    THREAD_BUFFERS.with(|storage| {
+      let mut storage = storage.borrow_mut();
+      if let Some(entry) =
+        storage.iter().find(|entry| entry.tracer_id == tracer_id)
+      {
+        return entry.buffer.clone();
+      }
+
+      let buffer = self.inner.register_thread_buffer();
+      storage.push(ThreadLocalBuffer {
+        tracer_id,
+        buffer: buffer.clone(),
+      });
+      buffer
+    })
+  }
+
+  #[must_use]
+  pub fn with_config(config: TracerConfig) -> Self {
+    let inner = Arc::new(TracerInner::new(config));
+    TracerInner::start_worker(&inner);
+    Self { inner }
+  }
+}
+
+impl Drop for Tracer {
+  fn drop(&mut self) {
+    if Arc::strong_count(&self.inner) == 2 {
+      self.inner.request_shutdown();
     }
+  }
+}
+
+#[derive(Debug)]
+struct WorkerSync {
+  condvar: Condvar,
+  lock: Mutex<()>,
+}
+
+impl WorkerSync {
+  fn new() -> Self {
+    Self {
+      condvar: Condvar::new(),
+      lock: Mutex::new(()),
+    }
+  }
+}
+
+impl TracerInner {
+  fn drain_buffers(&self) {
+    let mut events = Vec::new();
+
+    {
+      let mut buffers = self.buffers.lock().expect("buffers poisoned");
+      buffers.retain(|weak| {
+        if let Some(buffer) = weak.upgrade() {
+          let dropped = buffer.drain_into(&mut events);
+          if dropped > 0 {
+            events.push(AllocationEvent::new(
+              EventKind::Dropped { count: dropped },
+              0,
+              0,
+              0,
+            ));
+          }
+          true
+        } else {
+          false
+        }
+      });
+    }
+
+    if !events.is_empty()
+      && let Ok(mut aggregator) = self.aggregator.lock()
+    {
+      aggregator.ingest(events.drain(..));
+    }
+  }
+
+  fn new(config: TracerConfig) -> Self {
+    let enabled = AtomicBool::new(config.start_enabled);
+    Self {
+      aggregator: Mutex::new(Aggregator::new()),
+      buffers: Mutex::new(Vec::new()),
+      config,
+      enabled,
+      pending_flush: AtomicBool::new(false),
+      stop_flag: AtomicBool::new(false),
+      worker_handle: Mutex::new(None),
+      worker_sync: WorkerSync::new(),
+    }
+  }
+
+  fn notify_flush(&self) {
+    if !self.pending_flush.swap(true, Ordering::AcqRel) {
+      self.worker_sync.condvar.notify_one();
+    }
+  }
+
+  fn register_thread_buffer(&self) -> ThreadBuffer {
+    let buffer = ThreadBuffer::new(&self.config);
+    let weak = buffer.downgrade();
+    let mut buffers = self.buffers.lock().expect("buffers poisoned");
+    buffers.push(weak);
+    buffer
+  }
+
+  fn request_shutdown(&self) {
+    if !self.stop_flag.swap(true, Ordering::AcqRel) {
+      let guard = match self.worker_sync.lock.lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+      };
+      drop(guard);
+      self.worker_sync.condvar.notify_all();
+
+      let mut handle = match self.worker_handle.lock() {
+        Ok(handle) => handle,
+        Err(err) => err.into_inner(),
+      };
+      if let Some(join_handle) = handle.take() {
+        let _ = join_handle.join();
+      }
+    }
+  }
+
+  fn run_worker(self: Arc<Self>) {
+    loop {
+      if self.stop_flag.load(Ordering::Acquire) {
+        break;
+      }
+
+      self.drain_buffers();
+
+      if self.stop_flag.load(Ordering::Acquire) {
+        break;
+      }
+
+      let mut guard =
+        self.worker_sync.lock.lock().expect("worker lock poisoned");
+      if self.stop_flag.load(Ordering::Acquire) {
+        drop(guard);
+        break;
+      }
+
+      if !self.pending_flush.swap(false, Ordering::AcqRel) {
+        let (g, _) = self
+          .worker_sync
+          .condvar
+          .wait_timeout(guard, self.config.drain_interval)
+          .expect("worker condvar poisoned");
+        guard = g;
+      }
+      drop(guard);
+    }
+
+    self.drain_buffers();
+  }
+
+  fn start_worker(this: &Arc<Self>) {
+    let worker = Arc::clone(this);
+    let handle = thread::Builder::new()
+      .name("tracemalloc-drain".into())
+      .spawn(move || worker.run_worker())
+      .expect("failed to spawn tracemalloc drain worker");
+
+    let mut slot = this.worker_handle.lock().expect("worker handle poisoned");
+    *slot = Some(handle);
+  }
+}
+
+impl Drop for TracerInner {
+  fn drop(&mut self) {
+    self.request_shutdown();
   }
 }
 
@@ -174,5 +371,26 @@ mod tests {
     ));
 
     assert_eq!(tracer.snapshot().records().len(), 1);
+  }
+
+  #[test]
+  fn snapshot_drains_thread_buffers() {
+    let tracer = Tracer::new();
+    tracer.record_event(AllocationEvent::new(
+      EventKind::Allocation,
+      0x1,
+      8,
+      99,
+    ));
+
+    // Snapshot should force a synchronous drain even if the worker has not run yet.
+    let snapshot = tracer.snapshot();
+    assert!(
+      snapshot
+        .records()
+        .iter()
+        .any(|record| record.stack_id == 99),
+      "expected stack 99 in snapshot"
+    );
   }
 }

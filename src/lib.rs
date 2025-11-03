@@ -6,7 +6,7 @@
 //! The goal of this crate is to provide a low-overhead, highly concurrent memory
 //! trace collector that can be surfaced to Python through an FFI layer. The
 //! implementation is intentionally staged: start with a minimal, purely Rust
-//! collector and progressively layer in CPython integration and advanced
+//! collector and progressively layer in `CPython` integration and advanced
 //! snapshot/export features.
 
 pub mod aggregator;
