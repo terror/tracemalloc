@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_DIR="${ROOT_DIR}/python"
+VENV_DIR="${PYTHON_DIR}/.venv"
+
+DEFAULT_PYTHON="${HOME}/.pyenv/versions/3.12.7/bin/python"
+PYO3_PYTHON="${PYO3_PYTHON:-$DEFAULT_PYTHON}"
+
+if [[ ! -x "${PYO3_PYTHON}" ]]; then
+  echo "error: PYO3_PYTHON (${PYO3_PYTHON}) is not executable; set it to a shared CPython build" >&2
+  exit 1
+fi
+
+if [[ ! -d "${VENV_DIR}" ]]; then
+  "${PYO3_PYTHON}" -m venv "${VENV_DIR}"
+fi
+
+source "${VENV_DIR}/bin/activate"
+python -m pip install --upgrade pip maturin >/dev/null
+
+PYO3_PYTHON="${PYO3_PYTHON}" maturin develop --features extension-module --manifest-path "${PYTHON_DIR}/Cargo.toml" "$@"

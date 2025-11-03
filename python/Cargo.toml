@@ -1,0 +1,16 @@
+[package]
+name = "rust_tracemalloc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rust_tracemalloc"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.21" }
+tracemalloc = { path = ".." }

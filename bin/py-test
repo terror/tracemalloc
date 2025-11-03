@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+DEFAULT_PYTHON="${HOME}/.pyenv/versions/3.12.7/bin/python"
+PYO3_PYTHON="${PYO3_PYTHON:-$DEFAULT_PYTHON}"
+
+if [[ ! -x "${PYO3_PYTHON}" ]]; then
+  echo "error: PYO3_PYTHON (${PYO3_PYTHON}) is not executable; set it to a shared CPython build" >&2
+  exit 1
+fi
+
+cd "${ROOT_DIR}"
+PYO3_PYTHON="${PYO3_PYTHON}" cargo test --manifest-path "${ROOT_DIR}/python/Cargo.toml" --no-default-features "$@"

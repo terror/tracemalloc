@@ -16,3 +16,4 @@ fmt:
 
 test:
   cargo test
+  ./bin/py-test
