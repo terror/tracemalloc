@@ -13,4 +13,4 @@ if [[ ! -x "${PYO3_PYTHON}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
-PYO3_PYTHON="${PYO3_PYTHON}" cargo test --manifest-path "${ROOT_DIR}/python/Cargo.toml" --no-default-features "$@"
+PYO3_PYTHON="${PYO3_PYTHON}" cargo test --manifest-path "${ROOT_DIR}/py/Cargo.toml" --no-default-features "$@"

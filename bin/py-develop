@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PYTHON_DIR="${ROOT_DIR}/python"
+PYTHON_DIR="${ROOT_DIR}/py"
 VENV_DIR="${PYTHON_DIR}/.venv"
 
 DEFAULT_PYTHON="${HOME}/.pyenv/versions/3.12.7/bin/python"

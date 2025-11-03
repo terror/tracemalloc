@@ -349,7 +349,6 @@ dependencies = [
  "dashmap",
  "fastrand",
  "nohash-hasher",
- "once_cell",
  "smallvec",
 ]
 
