@@ -49,6 +49,48 @@ struct SamplingBytes {
   total_observed: AtomicU64,
 }
 
+impl SamplingBytes {
+  fn new(interval: std::num::NonZeroU64) -> Self {
+    let start = interval.get();
+
+    Self {
+      interval,
+      next_sample: AtomicU64::new(start),
+      total_observed: AtomicU64::new(0),
+    }
+  }
+
+  fn should_sample(&self, size: usize) -> bool {
+    let size_u64 = match u64::try_from(size) {
+      Ok(0) => return false,
+      Ok(value) => value,
+      Err(_) => u64::MAX,
+    };
+
+    let previous = self.total_observed.fetch_add(size_u64, Ordering::Relaxed);
+    let total = previous.saturating_add(size_u64);
+
+    loop {
+      let next = self.next_sample.load(Ordering::Acquire);
+
+      if total < next {
+        return false;
+      }
+
+      let interval = self.interval.get();
+      let new_next = next.saturating_add(interval.max(1));
+
+      if self
+        .next_sample
+        .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+      {
+        return true;
+      }
+    }
+  }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SamplingRate {
   All,
@@ -94,48 +136,6 @@ impl SamplingState {
           "probability must be clamped to [0.0, 1.0]"
         );
         fastrand::f64() < probability
-      }
-    }
-  }
-}
-
-impl SamplingBytes {
-  fn new(interval: std::num::NonZeroU64) -> Self {
-    let start = interval.get();
-
-    Self {
-      interval,
-      next_sample: AtomicU64::new(start),
-      total_observed: AtomicU64::new(0),
-    }
-  }
-
-  fn should_sample(&self, size: usize) -> bool {
-    let size_u64 = match u64::try_from(size) {
-      Ok(0) => return false,
-      Ok(value) => value,
-      Err(_) => u64::MAX,
-    };
-
-    let previous = self.total_observed.fetch_add(size_u64, Ordering::Relaxed);
-    let total = previous.saturating_add(size_u64);
-
-    loop {
-      let next = self.next_sample.load(Ordering::Acquire);
-
-      if total < next {
-        return false;
-      }
-
-      let interval = self.interval.get();
-      let new_next = next.saturating_add(interval.max(1));
-
-      if self
-        .next_sample
-        .compare_exchange(next, new_next, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
-      {
-        return true;
       }
     }
   }
@@ -231,316 +231,9 @@ struct TracerInner {
   worker_sync: WorkerSync,
 }
 
-/// Entry point for recording allocation events and producing snapshots.
-///
-/// The fast path records allocation events into per-thread lock-free buffers that a
-/// background worker drains into the global aggregator.
-#[derive(Clone, Debug)]
-pub struct Tracer {
-  inner: Arc<TracerInner>,
-}
-
-impl Default for Tracer {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl Tracer {
-  #[must_use]
-  pub fn builder() -> TracerBuilder {
-    TracerBuilder::new()
-  }
-
-  #[must_use]
-  pub fn config(&self) -> &TracerConfig {
-    &self.inner.config
-  }
-
-  pub fn disable(&self) {
-    self.inner.enabled.store(false, Ordering::Release);
-  }
-
-  pub fn enable(&self) {
-    self.inner.enabled.store(true, Ordering::Release);
-  }
-
-  #[must_use]
-  pub fn enabled(&self) -> bool {
-    self.inner.enabled.load(Ordering::Acquire)
-  }
-
-  fn enqueue_event(&self, event: AllocationEvent) {
-    let buffer = self.thread_buffer();
-    if let DrainAction::FlushPending = buffer.record(event) {
-      self.inner.notify_flush();
-    }
-  }
-
-  #[must_use]
-  pub fn new() -> Self {
-    Self::with_config(TracerConfig::default())
-  }
-
-  /// Fast-path helper that captures the current stack trace and records an
-  /// allocation event keyed by the interned stack identifier.
-  pub fn record_allocation(&self, address: usize, size: usize) {
-    if !self.enabled() {
-      return;
-    }
-
-    match self.inner.prepare_hot_event(
-      EventKind::Allocation,
-      address,
-      size,
-      None,
-    ) {
-      HotEvent::Sampled(event) => self.enqueue_event(event),
-      HotEvent::Skipped => {}
-      HotEvent::Missing => self.record_dropped_event(1),
-    }
-  }
-
-  /// Variant of `record_allocation` that uses Python-provided frames when
-  /// available. This is intended to be called from the `CPython` allocator hooks
-  /// once they have captured the interpreter stack.
-  pub fn record_allocation_with_frames(
-    &self,
-    address: usize,
-    size: usize,
-    frames: &[FrameMetadata],
-  ) {
-    if !self.enabled() {
-      return;
-    }
-
-    match self.inner.prepare_hot_event(
-      EventKind::Allocation,
-      address,
-      size,
-      Some(frames),
-    ) {
-      HotEvent::Sampled(event) => self.enqueue_event(event),
-      HotEvent::Skipped => {}
-      HotEvent::Missing => self.record_dropped_event(1),
-    }
-  }
-
-  /// Fast-path helper that updates aggregated statistics for a released
-  /// allocation using the previously recorded stack identifier.
-  pub fn record_deallocation(&self, address: usize, size: usize) {
-    if !self.enabled() {
-      return;
-    }
-
-    match self.inner.prepare_hot_event(
-      EventKind::Deallocation,
-      address,
-      size,
-      None,
-    ) {
-      HotEvent::Sampled(event) => self.enqueue_event(event),
-      HotEvent::Skipped => {}
-      HotEvent::Missing => self.record_dropped_event(1),
-    }
-  }
-
-  /// Deallocation variant that leverages Python-sourced metadata when available.
-  pub fn record_deallocation_with_frames(
-    &self,
-    address: usize,
-    size: usize,
-    frames: &[FrameMetadata],
-  ) {
-    if !self.enabled() {
-      return;
-    }
-
-    match self.inner.prepare_hot_event(
-      EventKind::Deallocation,
-      address,
-      size,
-      Some(frames),
-    ) {
-      HotEvent::Sampled(event) => self.enqueue_event(event),
-      HotEvent::Skipped => {}
-      HotEvent::Missing => self.record_dropped_event(1),
-    }
-  }
-
-  fn record_dropped_event(&self, count: u64) {
-    let dropped = AllocationEvent::new(EventKind::Dropped { count }, 0, 0, 0);
-    self.enqueue_event(dropped);
-  }
-
-  /// Feed a pre-built event directly into the per-thread buffer. A background worker
-  /// will eventually drain it into the aggregator.
-  pub fn record_event(&self, event: AllocationEvent) {
-    if !self.enabled() {
-      return;
-    }
-
-    self.enqueue_event(event);
-  }
-
-  /// Update aggregated statistics for a reallocation (`PyMem_Realloc` style).
-  ///
-  /// Generates both a deallocation for the old pointer and an allocation for
-  /// the new pointer. Callers should supply the old allocation size when
-  /// available; otherwise the tracer falls back to the previously recorded
-  /// size.
-  pub fn record_reallocation(
-    &self,
-    old_address: usize,
-    old_size: usize,
-    new_address: usize,
-    new_size: usize,
-  ) {
-    if !self.enabled() {
-      return;
-    }
-
-    match self.inner.prepare_reallocation(
-      old_address,
-      old_size,
-      new_address,
-      new_size,
-      None,
-    ) {
-      PreparedReallocation::Events {
-        deallocation,
-        allocation,
-      } => {
-        if let Some(event) = deallocation {
-          self.enqueue_event(event);
-        }
-
-        if let Some(event) = allocation {
-          self.enqueue_event(event);
-        }
-      }
-      PreparedReallocation::Skipped => {}
-      PreparedReallocation::Missing => self.record_dropped_event(2),
-    }
-  }
-
-  /// Reallocation helper with Python frame metadata supplied by the caller.
-  pub fn record_reallocation_with_frames(
-    &self,
-    old_address: usize,
-    old_size: usize,
-    new_address: usize,
-    new_size: usize,
-    frames: &[FrameMetadata],
-  ) {
-    if !self.enabled() {
-      return;
-    }
-
-    let frame_option = (!frames.is_empty()).then_some(frames);
-
-    match self.inner.prepare_reallocation(
-      old_address,
-      old_size,
-      new_address,
-      new_size,
-      frame_option,
-    ) {
-      PreparedReallocation::Events {
-        deallocation,
-        allocation,
-      } => {
-        if let Some(event) = deallocation {
-          self.enqueue_event(event);
-        }
-
-        if let Some(event) = allocation {
-          self.enqueue_event(event);
-        }
-      }
-      PreparedReallocation::Skipped => {}
-      PreparedReallocation::Missing => self.record_dropped_event(2),
-    }
-  }
-
-  pub fn reset(&self) {
-    self.inner.drain_buffers();
-
-    if let Ok(mut aggregator) = self.inner.aggregator.lock() {
-      aggregator.reset();
-    }
-
-    self.inner.allocation_index.clear();
-  }
-
-  /// Produce a point-in-time snapshot of the aggregated allocations.
-  ///
-  /// # Panics
-  ///
-  /// Panics if the internal aggregator mutex is poisoned.
-  #[must_use]
-  pub fn snapshot(&self) -> Snapshot {
-    self.inner.drain_buffers();
-    let guard = self.inner.aggregator.lock().expect("aggregator poisoned");
-    guard.snapshot()
-  }
-
-  #[must_use]
-  pub fn stack_table(&self) -> Arc<StackTable> {
-    Arc::clone(&self.inner.stack_table)
-  }
-
-  fn thread_buffer(&self) -> ThreadBuffer {
-    let tracer_id = Arc::as_ptr(&self.inner) as usize;
-
-    THREAD_BUFFERS.with(|storage| {
-      let mut storage = storage.borrow_mut();
-
-      if let Some(entry) =
-        storage.iter().find(|entry| entry.tracer_id == tracer_id)
-      {
-        return entry.buffer.clone();
-      }
-
-      let buffer = self.inner.register_thread_buffer();
-
-      storage.push(ThreadLocalBuffer {
-        tracer_id,
-        buffer: buffer.clone(),
-      });
-
-      buffer
-    })
-  }
-
-  #[must_use]
-  pub fn with_config(config: TracerConfig) -> Self {
-    let inner = Arc::new(TracerInner::new(config));
-    TracerInner::start_worker(&inner);
-    Self { inner }
-  }
-}
-
-impl Drop for Tracer {
+impl Drop for TracerInner {
   fn drop(&mut self) {
-    if Arc::strong_count(&self.inner) == 2 {
-      self.inner.request_shutdown();
-    }
-  }
-}
-
-#[derive(Debug)]
-struct WorkerSync {
-  condvar: Condvar,
-  lock: Mutex<()>,
-}
-
-impl WorkerSync {
-  fn new() -> Self {
-    Self {
-      condvar: Condvar::new(),
-      lock: Mutex::new(()),
-    }
+    self.request_shutdown();
   }
 }
 
@@ -796,9 +489,317 @@ impl TracerInner {
   }
 }
 
-impl Drop for TracerInner {
+/// Entry point for recording allocation events and producing snapshots.
+///
+/// The fast path records allocation events into per-thread lock-free buffers that a
+/// background worker drains into the global aggregator.
+#[derive(Clone, Debug)]
+pub struct Tracer {
+  inner: Arc<TracerInner>,
+}
+
+impl Default for Tracer {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl Drop for Tracer {
   fn drop(&mut self) {
-    self.request_shutdown();
+    if Arc::strong_count(&self.inner) == 2 {
+      self.inner.request_shutdown();
+    }
+  }
+}
+
+impl Tracer {
+  #[must_use]
+  pub fn builder() -> TracerBuilder {
+    TracerBuilder::new()
+  }
+
+  #[must_use]
+  pub fn config(&self) -> &TracerConfig {
+    &self.inner.config
+  }
+
+  pub fn disable(&self) {
+    self.inner.enabled.store(false, Ordering::Release);
+  }
+
+  pub fn enable(&self) {
+    self.inner.enabled.store(true, Ordering::Release);
+  }
+
+  #[must_use]
+  pub fn enabled(&self) -> bool {
+    self.inner.enabled.load(Ordering::Acquire)
+  }
+
+  fn enqueue_event(&self, event: AllocationEvent) {
+    let buffer = self.thread_buffer();
+
+    if let DrainAction::FlushPending = buffer.record(event) {
+      self.inner.notify_flush();
+    }
+  }
+
+  #[must_use]
+  pub fn new() -> Self {
+    Self::with_config(TracerConfig::default())
+  }
+
+  /// Fast-path helper that captures the current stack trace and records an
+  /// allocation event keyed by the interned stack identifier.
+  pub fn record_allocation(&self, address: usize, size: usize) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_hot_event(
+      EventKind::Allocation,
+      address,
+      size,
+      None,
+    ) {
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
+    }
+  }
+
+  /// Variant of `record_allocation` that uses Python-provided frames when
+  /// available. This is intended to be called from the `CPython` allocator hooks
+  /// once they have captured the interpreter stack.
+  pub fn record_allocation_with_frames(
+    &self,
+    address: usize,
+    size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_hot_event(
+      EventKind::Allocation,
+      address,
+      size,
+      Some(frames),
+    ) {
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
+    }
+  }
+
+  /// Fast-path helper that updates aggregated statistics for a released
+  /// allocation using the previously recorded stack identifier.
+  pub fn record_deallocation(&self, address: usize, size: usize) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_hot_event(
+      EventKind::Deallocation,
+      address,
+      size,
+      None,
+    ) {
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
+    }
+  }
+
+  /// Deallocation variant that leverages Python-sourced metadata when available.
+  pub fn record_deallocation_with_frames(
+    &self,
+    address: usize,
+    size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_hot_event(
+      EventKind::Deallocation,
+      address,
+      size,
+      Some(frames),
+    ) {
+      HotEvent::Sampled(event) => self.enqueue_event(event),
+      HotEvent::Skipped => {}
+      HotEvent::Missing => self.record_dropped_event(1),
+    }
+  }
+
+  fn record_dropped_event(&self, count: u64) {
+    let dropped = AllocationEvent::new(EventKind::Dropped { count }, 0, 0, 0);
+    self.enqueue_event(dropped);
+  }
+
+  /// Feed a pre-built event directly into the per-thread buffer. A background worker
+  /// will eventually drain it into the aggregator.
+  pub fn record_event(&self, event: AllocationEvent) {
+    if !self.enabled() {
+      return;
+    }
+
+    self.enqueue_event(event);
+  }
+
+  /// Update aggregated statistics for a reallocation (`PyMem_Realloc` style).
+  ///
+  /// Generates both a deallocation for the old pointer and an allocation for
+  /// the new pointer. Callers should supply the old allocation size when
+  /// available; otherwise the tracer falls back to the previously recorded
+  /// size.
+  pub fn record_reallocation(
+    &self,
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    match self.inner.prepare_reallocation(
+      old_address,
+      old_size,
+      new_address,
+      new_size,
+      None,
+    ) {
+      PreparedReallocation::Events {
+        deallocation,
+        allocation,
+      } => {
+        if let Some(event) = deallocation {
+          self.enqueue_event(event);
+        }
+
+        if let Some(event) = allocation {
+          self.enqueue_event(event);
+        }
+      }
+      PreparedReallocation::Skipped => {}
+      PreparedReallocation::Missing => self.record_dropped_event(2),
+    }
+  }
+
+  /// Reallocation helper with Python frame metadata supplied by the caller.
+  pub fn record_reallocation_with_frames(
+    &self,
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+    frames: &[FrameMetadata],
+  ) {
+    if !self.enabled() {
+      return;
+    }
+
+    let frame_option = (!frames.is_empty()).then_some(frames);
+
+    match self.inner.prepare_reallocation(
+      old_address,
+      old_size,
+      new_address,
+      new_size,
+      frame_option,
+    ) {
+      PreparedReallocation::Events {
+        deallocation,
+        allocation,
+      } => {
+        if let Some(event) = deallocation {
+          self.enqueue_event(event);
+        }
+
+        if let Some(event) = allocation {
+          self.enqueue_event(event);
+        }
+      }
+      PreparedReallocation::Skipped => {}
+      PreparedReallocation::Missing => self.record_dropped_event(2),
+    }
+  }
+
+  pub fn reset(&self) {
+    self.inner.drain_buffers();
+
+    if let Ok(mut aggregator) = self.inner.aggregator.lock() {
+      aggregator.reset();
+    }
+
+    self.inner.allocation_index.clear();
+  }
+
+  /// Produce a point-in-time snapshot of the aggregated allocations.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the internal aggregator mutex is poisoned.
+  #[must_use]
+  pub fn snapshot(&self) -> Snapshot {
+    self.inner.drain_buffers();
+    let guard = self.inner.aggregator.lock().expect("aggregator poisoned");
+    guard.snapshot()
+  }
+
+  #[must_use]
+  pub fn stack_table(&self) -> Arc<StackTable> {
+    Arc::clone(&self.inner.stack_table)
+  }
+
+  fn thread_buffer(&self) -> ThreadBuffer {
+    let tracer_id = Arc::as_ptr(&self.inner) as usize;
+
+    THREAD_BUFFERS.with(|storage| {
+      let mut storage = storage.borrow_mut();
+
+      if let Some(entry) =
+        storage.iter().find(|entry| entry.tracer_id == tracer_id)
+      {
+        return entry.buffer.clone();
+      }
+
+      let buffer = self.inner.register_thread_buffer();
+
+      storage.push(ThreadLocalBuffer {
+        tracer_id,
+        buffer: buffer.clone(),
+      });
+
+      buffer
+    })
+  }
+
+  #[must_use]
+  pub fn with_config(config: TracerConfig) -> Self {
+    let inner = Arc::new(TracerInner::new(config));
+    TracerInner::start_worker(&inner);
+    Self { inner }
+  }
+}
+
+#[derive(Debug)]
+struct WorkerSync {
+  condvar: Condvar,
+  lock: Mutex<()>,
+}
+
+impl WorkerSync {
+  fn new() -> Self {
+    Self {
+      condvar: Condvar::new(),
+      lock: Mutex::new(()),
+    }
   }
 }
 
