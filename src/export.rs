@@ -217,74 +217,6 @@ impl StringTable {
   }
 }
 
-impl Snapshot {
-  /// Serialize the snapshot delta between this snapshot and a baseline snapshot
-  /// to JSON.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if serialization to JSON fails.
-  pub fn export_delta_json<W: Write>(
-    &self,
-    older: &Snapshot,
-    writer: W,
-  ) -> Result<(), ExportError> {
-    SnapshotDelta::from_snapshots(self, older).export_json(writer)
-  }
-
-  /// Serialize the snapshot to JSON using the provided writer.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if serialization to JSON fails.
-  pub fn export_json<W: Write>(&self, writer: W) -> Result<(), ExportError> {
-    serde_json::to_writer(writer, self)?;
-    Ok(())
-  }
-
-  /// Serialize the snapshot to the pprof proto format.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the snapshot cannot be encoded or written to the
-  /// provided writer.
-  #[cfg(not(windows))]
-  pub fn export_pprof<W: Write>(
-    &self,
-    mut writer: W,
-  ) -> Result<(), ExportError> {
-    let profile = build_pprof_profile(self);
-    let mut buffer = Vec::with_capacity(4096);
-    profile.encode(&mut buffer)?;
-    writer.write_all(&buffer)?;
-    Ok(())
-  }
-
-  #[cfg(windows)]
-  pub fn export_pprof<W: Write>(&self, _writer: W) -> Result<(), ExportError> {
-    Err(
-      io::Error::new(
-        io::ErrorKind::Unsupported,
-        "pprof export is not available on Windows",
-      )
-      .into(),
-    )
-  }
-
-  /// Stream this snapshot into the provided writer.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the downstream writer reports a failure.
-  pub fn stream_into<W: SnapshotStreamWriter>(
-    &self,
-    writer: &mut W,
-    timestamp: Option<SystemTime>,
-  ) -> Result<(), ExportError> {
-    writer.write_snapshot(self, timestamp)
-  }
-}
-
 fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
   ts.duration_since(SystemTime::UNIX_EPOCH)
     .ok()
@@ -292,7 +224,7 @@ fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
 }
 
 #[cfg(not(windows))]
-fn build_pprof_profile(snapshot: &Snapshot) -> Profile {
+pub fn build_pprof_profile(snapshot: &Snapshot) -> Profile {
   let mut string_table = StringTable::new();
 
   let mut functions = Vec::new();

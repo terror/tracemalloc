@@ -42,6 +42,9 @@ use {
 };
 
 #[cfg(not(windows))]
+use export::build_pprof_profile;
+
+#[cfg(not(windows))]
 use pprof::protos::{Function, Line, Location, Profile, Sample, ValueType};
 
 #[cfg(not(windows))]
