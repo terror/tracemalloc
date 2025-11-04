@@ -11,5 +11,8 @@ default:
 fmt:
    uv run ruff check --select I --fix && uv run ruff format
 
+install:
+  uv pip install --force-reinstall --no-deps --editable ../py
+
 typecheck:
   uv run ty check
