@@ -18,16 +18,16 @@ impl FrameMetadata {
   #[must_use]
   pub fn borrowed(filename: &str, function: &str, lineno: u32) -> Self {
     Self {
-      filename: intern_filename(filename),
-      function: intern_function(function),
+      filename: FILENAME_INTERNER.intern(filename),
+      function: FUNCTION_INTERNER.intern(function),
       lineno,
     }
   }
 
   fn from_owned(filename: String, function: String, lineno: u32) -> Self {
     Self {
-      filename: intern_owned_filename(filename),
-      function: intern_owned_function(function),
+      filename: FILENAME_INTERNER.intern_owned(filename),
+      function: FUNCTION_INTERNER.intern_owned(function),
       lineno,
     }
   }
@@ -195,22 +195,6 @@ impl StackTable {
     let inner = self.lock_inner();
     inner.by_id.get(&stack_id).cloned()
   }
-}
-
-fn intern_filename(value: &str) -> Arc<str> {
-  FILENAME_INTERNER.intern(value)
-}
-
-fn intern_owned_filename(value: String) -> Arc<str> {
-  FILENAME_INTERNER.intern_owned(value)
-}
-
-fn intern_function(value: &str) -> Arc<str> {
-  FUNCTION_INTERNER.intern(value)
-}
-
-fn intern_owned_function(value: String) -> Arc<str> {
-  FUNCTION_INTERNER.intern_owned(value)
 }
 
 #[cfg(test)]

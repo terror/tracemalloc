@@ -1,11 +1,5 @@
 use super::*;
 
-#[cfg(not(windows))]
-use pprof::protos::{Function, Line, Location, Profile, Sample, ValueType};
-
-#[cfg(not(windows))]
-use prost::Message;
-
 /// Errors that can occur when exporting or streaming snapshots.
 #[derive(Debug)]
 pub enum ExportError {
@@ -72,16 +66,6 @@ pub struct JsonLinesWriter<W: Write> {
   writer: W,
 }
 
-impl<W: Write> JsonLinesWriter<W> {
-  pub fn into_inner(self) -> W {
-    self.writer
-  }
-
-  pub fn new(writer: W) -> Self {
-    Self { writer }
-  }
-}
-
 impl<W: Write> SnapshotStreamWriter for JsonLinesWriter<W> {
   fn write_snapshot(
     &mut self,
@@ -95,10 +79,34 @@ impl<W: Write> SnapshotStreamWriter for JsonLinesWriter<W> {
   }
 }
 
+impl<W: Write> JsonLinesWriter<W> {
+  pub fn into_inner(self) -> W {
+    self.writer
+  }
+
+  pub fn new(writer: W) -> Self {
+    Self { writer }
+  }
+}
+
 /// Streaming writer backed by an mmap'd file.
 pub struct MmapJsonStreamWriter {
   mmap: MmapMut,
   position: usize,
+}
+
+impl SnapshotStreamWriter for MmapJsonStreamWriter {
+  fn write_snapshot(
+    &mut self,
+    snapshot: &Snapshot,
+    timestamp: Option<SystemTime>,
+  ) -> Result<(), ExportError> {
+    let chunk = StreamChunk::new(snapshot, timestamp);
+    let mut encoded = serde_json::to_vec(&chunk)?;
+    encoded.push(b'\n');
+    self.write_bytes(&encoded)?;
+    Ok(())
+  }
 }
 
 impl MmapJsonStreamWriter {
@@ -108,6 +116,7 @@ impl MmapJsonStreamWriter {
   /// mapped into memory.
   pub fn create(path: impl AsRef<Path>, capacity: usize) -> io::Result<Self> {
     let capacity = capacity.max(1);
+
     let file = OpenOptions::new()
       .create(true)
       .write(true)
@@ -150,21 +159,9 @@ impl MmapJsonStreamWriter {
     }
 
     self.mmap[self.position..end].copy_from_slice(data);
-    self.position = end;
-    Ok(())
-  }
-}
 
-impl SnapshotStreamWriter for MmapJsonStreamWriter {
-  fn write_snapshot(
-    &mut self,
-    snapshot: &Snapshot,
-    timestamp: Option<SystemTime>,
-  ) -> Result<(), ExportError> {
-    let chunk = StreamChunk::new(snapshot, timestamp);
-    let mut encoded = serde_json::to_vec(&chunk)?;
-    encoded.push(b'\n');
-    self.write_bytes(&encoded)?;
+    self.position = end;
+
     Ok(())
   }
 }

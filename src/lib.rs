@@ -41,6 +41,12 @@ use {
   },
 };
 
+#[cfg(not(windows))]
+use pprof::protos::{Function, Line, Location, Profile, Sample, ValueType};
+
+#[cfg(not(windows))]
+use prost::Message;
+
 pub use {
   aggregator::Aggregator,
   config::TracerConfig,
