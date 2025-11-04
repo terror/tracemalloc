@@ -288,18 +288,6 @@ impl Snapshot {
   }
 }
 
-impl SnapshotDelta {
-  /// Serialize the snapshot delta to JSON using the provided writer.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if serialization to JSON fails.
-  pub fn export_json<W: Write>(&self, writer: W) -> Result<(), ExportError> {
-    serde_json::to_writer(writer, self)?;
-    Ok(())
-  }
-}
-
 fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
   ts.duration_since(SystemTime::UNIX_EPOCH)
     .ok()

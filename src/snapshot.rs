@@ -114,6 +114,16 @@ impl SnapshotDelta {
     self.dropped_events
   }
 
+  /// Serialize the snapshot delta to JSON using the provided writer.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if serialization to JSON fails.
+  pub fn export_json<W: Write>(&self, writer: W) -> Result<(), ExportError> {
+    serde_json::to_writer(writer, self)?;
+    Ok(())
+  }
+
   #[must_use]
   pub fn from_snapshots(newer: &Snapshot, older: &Snapshot) -> Self {
     let mut deltas = Vec::new();
