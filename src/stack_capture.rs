@@ -59,6 +59,7 @@ impl StackCollector {
         if frames.len() >= self.max_depth {
           break;
         }
+
         frames.push(frame.clone());
       }
     }
@@ -100,6 +101,7 @@ impl StackCollector {
       }
 
       frames.push(extract_metadata(frame));
+
       true
     });
   }
@@ -110,10 +112,9 @@ impl StackCollector {
 
   #[must_use]
   pub fn new(stack_table: Arc<StackTable>, config: &TracerConfig) -> Self {
-    let max_depth = usize::from(config.max_stack_depth.max(1));
     Self {
       capture_native: config.capture_native,
-      max_depth,
+      max_depth: usize::from(config.max_stack_depth.max(1)),
       native_skip_frames: config.native_skip_frames,
       python_skip_frames: config.python_skip_frames,
       stack_table,
@@ -179,7 +180,7 @@ fn extract_metadata(frame: &Frame) -> FrameMetadata {
   )
 }
 
-fn path_to_string(path: &std::path::Path) -> Option<&str> {
+fn path_to_string(path: &Path) -> Option<&str> {
   path
     .to_str()
     .or_else(|| path.file_name().and_then(OsStr::to_str))
@@ -192,8 +193,6 @@ fn symbol_name_to_string(name: &SymbolName<'_>) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::TracerConfig;
-  use std::sync::Arc;
 
   #[test]
   fn uses_python_frames_when_available() {
@@ -205,14 +204,18 @@ mod tests {
     };
 
     let table = Arc::new(StackTable::new());
+
     let collector = StackCollector::new(Arc::clone(&table), &config);
+
     let frames = vec![
       FrameMetadata::new("hidden.py", "wrapper", 1),
       FrameMetadata::new("worker.py", "run", 2),
     ];
 
-    let stack_id = collector.capture_and_intern(Some(&frames));
-    let stack = table.resolve(stack_id).expect("missing stack");
+    let stack = table
+      .resolve(collector.capture_and_intern(Some(&frames)))
+      .expect("missing stack");
+
     assert_eq!(stack.frames().len(), 1);
     assert_eq!(stack.frames()[0].filename.as_ref(), "worker.py");
   }
@@ -226,10 +229,13 @@ mod tests {
     };
 
     let table = Arc::new(StackTable::new());
+
     let collector = StackCollector::new(Arc::clone(&table), &config);
 
-    let stack_id = collector.capture_and_intern(Some(&[]));
-    let stack = table.resolve(stack_id).expect("missing stack");
+    let stack = table
+      .resolve(collector.capture_and_intern(Some(&[])))
+      .expect("missing stack");
+
     assert_eq!(stack.frames()[0].filename.as_ref(), "<unknown>");
   }
 }

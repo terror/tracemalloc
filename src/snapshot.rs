@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Serialize)]
+struct FrameExport<'a> {
+  filename: &'a str,
+  function: &'a str,
+  lineno: u32,
+}
+
 /// A single aggregated entry representing allocations attributed to a stack.
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
@@ -12,11 +19,54 @@ pub struct SnapshotRecord {
   pub total_freed: u64,
 }
 
+impl Serialize for SnapshotRecord {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    let mut state = serializer.serialize_struct("SnapshotRecord", 7)?;
+    state.serialize_field("stack_id", &self.stack_id)?;
+    state.serialize_field("allocations", &self.allocations)?;
+    state.serialize_field("deallocations", &self.deallocations)?;
+    state.serialize_field("current_bytes", &self.current_bytes)?;
+    state.serialize_field("total_allocated", &self.total_allocated)?;
+    state.serialize_field("total_freed", &self.total_freed)?;
+
+    if let Some(stack) = &self.stack {
+      let frames = stack
+        .frames()
+        .iter()
+        .map(|frame| FrameExport {
+          filename: frame.filename.as_ref(),
+          function: frame.function.as_ref(),
+          lineno: frame.lineno,
+        })
+        .collect::<Vec<FrameExport<'_>>>();
+
+      state.serialize_field("frames", &frames)?;
+    }
+
+    state.end()
+  }
+}
+
 /// Immutable view of the current tracer state.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
   dropped_events: u64,
   records: Vec<SnapshotRecord>,
+}
+
+impl Serialize for Snapshot {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    let mut state = serializer.serialize_struct("Snapshot", 2)?;
+    state.serialize_field("dropped_events", &self.dropped_events)?;
+    state.serialize_field("records", &self.records)?;
+    state.end()
+  }
 }
 
 impl Snapshot {
@@ -44,6 +94,18 @@ impl Snapshot {
 pub struct SnapshotDelta {
   dropped_events: i64,
   records: Vec<SnapshotRecord>,
+}
+
+impl Serialize for SnapshotDelta {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    let mut state = serializer.serialize_struct("SnapshotDelta", 2)?;
+    state.serialize_field("dropped_events", &self.dropped_events)?;
+    state.serialize_field("records", &self.records)?;
+    state.end()
+  }
 }
 
 impl SnapshotDelta {

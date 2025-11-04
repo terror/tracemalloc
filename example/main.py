@@ -84,7 +84,7 @@ def main() -> None:
 
   snapshot = tracemalloc.take_snapshot()
 
-  stats = collect_top_records(snapshot['records'])
+  stats = collect_top_records(snapshot.records())
 
   print('\nTop allocation sites:')
 

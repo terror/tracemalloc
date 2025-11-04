@@ -1,7 +1,9 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use {
   pyo3::{
     Bound, Py,
-    exceptions::{PyRuntimeError, PyTypeError},
+    exceptions::{PyRuntimeError, PyTypeError, PyValueError},
     ffi,
     ffi::PyMemAllocatorDomain::{
       PYMEM_DOMAIN_MEM, PYMEM_DOMAIN_OBJ, PYMEM_DOMAIN_RAW,
@@ -14,12 +16,19 @@ use {
   std::{
     cell::Cell,
     collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write},
     mem::MaybeUninit,
     os::raw::c_void,
+    path::PathBuf,
     ptr,
     sync::{Mutex, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
   },
-  tracemalloc::{FrameMetadata, Snapshot, Tracer},
+  tracemalloc::{
+    ExportError, FrameMetadata, MmapJsonStreamWriter, Snapshot, SnapshotDelta,
+    SnapshotRecord, Tracer,
+  },
 };
 
 static STATE: RwLock<Option<Box<ShimState>>> = RwLock::new(None);
@@ -90,9 +99,11 @@ fn parse_exporters(exporters: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>
 
     for item in iterator {
       let value = item?;
+
       let py_str = value.downcast::<PyString>().map_err(|_| {
         PyTypeError::new_err("exporters must be strings or iterables of strings")
       })?;
+
       parsed.push(py_str.to_string_lossy().into_owned());
     }
 
@@ -198,7 +209,7 @@ fn is_tracing() -> bool {
 }
 
 #[pyfunction]
-fn take_snapshot(py: Python<'_>) -> PyResult<PyObject> {
+fn take_snapshot(_py: Python<'_>) -> PyResult<PySnapshot> {
   let guard = STATE
     .read()
     .map_err(|_| PyRuntimeError::new_err("tracer state poisoned"))?;
@@ -209,16 +220,16 @@ fn take_snapshot(py: Python<'_>) -> PyResult<PyObject> {
 
   let snapshot = state.tracer.snapshot();
 
-  snapshot_to_python(py, snapshot)
+  Ok(PySnapshot::from(snapshot))
 }
 
-fn snapshot_to_python(
-  py: Python<'_>,
-  snapshot: Snapshot,
-) -> PyResult<PyObject> {
-  let records = PyList::empty_bound(py);
+fn snapshot_records_to_python<'py>(
+  py: Python<'py>,
+  records: &[SnapshotRecord],
+) -> PyResult<Bound<'py, PyList>> {
+  let list = PyList::empty_bound(py);
 
-  for record in snapshot.records() {
+  for record in records {
     let entry = PyDict::new_bound(py);
     entry.set_item("stack_id", record.stack_id)?;
     entry.set_item("current_bytes", record.current_bytes)?;
@@ -235,28 +246,303 @@ fn snapshot_to_python(
         frame_dict.set_item("filename", frame.filename.as_ref())?;
         frame_dict.set_item("function", frame.function.as_ref())?;
         frame_dict.set_item("lineno", frame.lineno)?;
-        let frame_obj = frame_dict.unbind();
-        frames.append(frame_obj)?;
+        frames.append(frame_dict.unbind())?;
       }
 
-      let frames_obj = frames.unbind();
-
-      entry.set_item("frames", frames_obj)?;
+      entry.set_item("frames", frames.unbind())?;
     }
 
-    let entry_obj = entry.unbind();
-
-    records.append(entry_obj)?;
+    list.append(entry.unbind())?;
   }
 
+  Ok(list)
+}
+
+fn snapshot_to_python(py: Python<'_>, snapshot: &Snapshot) -> PyResult<PyObject> {
+  let records = snapshot_records_to_python(py, snapshot.records())?;
   let result = PyDict::new_bound(py);
-
-  let records_obj = records.unbind();
-
-  result.set_item("records", records_obj)?;
+  result.set_item("records", records)?;
   result.set_item("dropped_events", snapshot.dropped_events())?;
-
   Ok(result.unbind().into())
+}
+
+fn snapshot_delta_to_python(
+  py: Python<'_>,
+  delta: &SnapshotDelta,
+) -> PyResult<PyObject> {
+  let records = snapshot_records_to_python(py, delta.records())?;
+  let result = PyDict::new_bound(py);
+  result.set_item("records", records)?;
+  result.set_item("dropped_events", delta.dropped_events())?;
+  Ok(result.unbind().into())
+}
+
+fn extract_path(path: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
+  path
+    .extract::<PathBuf>()
+    .map_err(|_| PyTypeError::new_err("path must be str or os.PathLike"))
+}
+
+fn optional_timestamp(seconds: Option<f64>) -> PyResult<Option<SystemTime>> {
+  let Some(value) = seconds else {
+    return Ok(None);
+  };
+
+  if value.is_sign_negative() {
+    return Err(PyValueError::new_err(
+      "timestamp must be greater than or equal to zero",
+    ));
+  }
+
+  let duration = Duration::from_secs_f64(value);
+
+  Ok(Some(UNIX_EPOCH + duration))
+}
+
+fn export_error(err: ExportError) -> PyErr {
+  PyRuntimeError::new_err(err.to_string())
+}
+
+fn vec_to_utf8(bytes: Vec<u8>) -> PyResult<String> {
+  String::from_utf8(bytes)
+    .map_err(|err| PyRuntimeError::new_err(err.to_string()))
+}
+
+#[pyclass(name = "Snapshot", module = "rust_tracemalloc")]
+pub struct PySnapshot {
+  inner: Snapshot,
+}
+
+impl From<Snapshot> for PySnapshot {
+  fn from(inner: Snapshot) -> Self {
+    Self { inner }
+  }
+}
+
+#[pymethods]
+impl PySnapshot {
+  #[getter]
+  fn dropped_events(&self) -> u64 {
+    self.inner.dropped_events()
+  }
+
+  fn records(&self, py: Python<'_>) -> PyResult<PyObject> {
+    Ok(snapshot_records_to_python(py, self.inner.records())?
+      .unbind()
+      .into())
+  }
+
+  fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    snapshot_to_python(py, &self.inner)
+  }
+
+  fn compare_to(&self, other: &PySnapshot) -> PySnapshotDelta {
+    SnapshotDelta::from_snapshots(&self.inner, &other.inner).into()
+  }
+
+  fn to_json(&self) -> PyResult<String> {
+    let mut buffer = Vec::new();
+
+    self
+      .inner
+      .export_json(&mut buffer)
+      .map_err(export_error)?;
+
+    vec_to_utf8(buffer)
+  }
+
+  fn export_json(&self, path: &Bound<'_, PyAny>) -> PyResult<()> {
+    let path = extract_path(path)?;
+
+    let file =
+      File::create(&path).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    let mut writer = BufWriter::new(file);
+
+    self
+      .inner
+      .export_json(&mut writer)
+      .map_err(export_error)?;
+
+    writer
+      .flush()
+      .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    Ok(())
+  }
+
+  fn export_pprof(&self, path: &Bound<'_, PyAny>) -> PyResult<()> {
+    let path = extract_path(path)?;
+
+    let file =
+      File::create(&path).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    let mut writer = BufWriter::new(file);
+
+    self
+      .inner
+      .export_pprof(&mut writer)
+      .map_err(export_error)?;
+
+    writer
+      .flush()
+      .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    Ok(())
+  }
+
+  fn stream_to_mmap(
+    &self,
+    path: &Bound<'_, PyAny>,
+    capacity: usize,
+    timestamp: Option<f64>,
+  ) -> PyResult<()> {
+    let path = extract_path(path)?;
+
+    let mut writer = MmapJsonStreamWriter::create(&path, capacity)
+      .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    let ts = optional_timestamp(timestamp)?;
+
+    self
+      .inner
+      .stream_into(&mut writer, ts)
+      .map_err(export_error)?;
+
+    writer
+      .flush()
+      .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    Ok(())
+  }
+}
+
+#[pyclass(name = "SnapshotDelta", module = "rust_tracemalloc")]
+pub struct PySnapshotDelta {
+  inner: SnapshotDelta,
+}
+
+impl From<SnapshotDelta> for PySnapshotDelta {
+  fn from(inner: SnapshotDelta) -> Self {
+    Self { inner }
+  }
+}
+
+#[pymethods]
+impl PySnapshotDelta {
+  #[getter]
+  fn dropped_events(&self) -> i64 {
+    self.inner.dropped_events()
+  }
+
+  fn records(&self, py: Python<'_>) -> PyResult<PyObject> {
+    Ok(snapshot_records_to_python(py, self.inner.records())?
+      .unbind()
+      .into())
+  }
+
+  fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    snapshot_delta_to_python(py, &self.inner)
+  }
+
+  fn to_json(&self) -> PyResult<String> {
+    let mut buffer = Vec::new();
+
+    self
+      .inner
+      .export_json(&mut buffer)
+      .map_err(export_error)?;
+
+    vec_to_utf8(buffer)
+  }
+
+  fn export_json(&self, path: &Bound<'_, PyAny>) -> PyResult<()> {
+    let path = extract_path(path)?;
+
+    let file =
+      File::create(&path).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    let mut writer = BufWriter::new(file);
+
+    self
+      .inner
+      .export_json(&mut writer)
+      .map_err(export_error)?;
+
+    writer
+      .flush()
+      .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    Ok(())
+  }
+}
+
+#[pyclass(module = "rust_tracemalloc")]
+pub struct SnapshotStream {
+  writer: Option<MmapJsonStreamWriter>,
+}
+
+impl SnapshotStream {
+  fn new(writer: MmapJsonStreamWriter) -> Self {
+    Self {
+      writer: Some(writer),
+    }
+  }
+}
+
+#[pymethods]
+impl SnapshotStream {
+  fn write(&mut self, snapshot: &PySnapshot, timestamp: Option<f64>) -> PyResult<()> {
+    let writer = self
+      .writer
+      .as_mut()
+      .ok_or_else(|| PyRuntimeError::new_err("snapshot stream is closed"))?;
+
+    let ts = optional_timestamp(timestamp)?;
+
+    snapshot
+      .inner
+      .stream_into(writer, ts)
+      .map_err(export_error)?;
+
+    Ok(())
+  }
+
+  fn flush(&self) -> PyResult<()> {
+    if let Some(writer) = &self.writer {
+      writer
+        .flush()
+        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+    }
+
+    Ok(())
+  }
+
+  fn close(&mut self) {
+    self.writer = None;
+  }
+}
+
+#[pyfunction]
+fn compare_snapshots(
+  newer: &PySnapshot,
+  older: &PySnapshot,
+) -> PySnapshotDelta {
+  SnapshotDelta::from_snapshots(&newer.inner, &older.inner).into()
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, capacity))]
+fn open_snapshot_stream(
+  path: Bound<'_, PyAny>,
+  capacity: usize,
+) -> PyResult<SnapshotStream> {
+  let path = extract_path(&path)?;
+
+  let writer = MmapJsonStreamWriter::create(&path, capacity)
+    .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+  Ok(SnapshotStream::new(writer))
 }
 
 struct ShimState {
@@ -763,6 +1049,12 @@ fn rust_tracemalloc(py: Python<'_>, module: &PyModule) -> PyResult<()> {
   module.add_function(wrap_pyfunction!(stop, module)?)?;
   module.add_function(wrap_pyfunction!(is_tracing, module)?)?;
   module.add_function(wrap_pyfunction!(take_snapshot, module)?)?;
+  module.add_function(wrap_pyfunction!(compare_snapshots, module)?)?;
+  module.add_function(wrap_pyfunction!(open_snapshot_stream, module)?)?;
+
+  module.add_class::<PySnapshot>()?;
+  module.add_class::<PySnapshotDelta>()?;
+  module.add_class::<SnapshotStream>()?;
 
   let version = PyDict::new_bound(py);
   version.set_item("major", 0)?;

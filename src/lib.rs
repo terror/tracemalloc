@@ -6,6 +6,7 @@
 mod aggregator;
 mod config;
 mod event;
+mod export;
 mod ring_buffer;
 mod snapshot;
 mod stack;
@@ -16,22 +17,29 @@ use {
   backtrace::{Frame, SymbolName},
   crossbeam_queue::ArrayQueue,
   dashmap::{DashMap, mapref::entry::Entry},
+  memmap2::MmapMut,
   nohash_hasher::BuildNoHashHasher,
+  pprof::protos::{Function, Line, Location, Profile, Sample, ValueType},
+  prost::Message,
   ring_buffer::ThreadBufferInner,
+  serde::{Serialize, Serializer, ser::SerializeStruct},
   smallvec::SmallVec,
-  snapshot::SnapshotRecord,
   stack_capture::StackCollector,
   std::{
     cell::RefCell,
     collections::HashMap,
     ffi::OsStr,
+    fmt::{self, Display, Formatter},
+    fs::OpenOptions,
+    io::{self, Write},
     mem::size_of,
+    path::Path,
     sync::{
       Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak,
       atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
   },
 };
 
@@ -39,8 +47,11 @@ pub use {
   aggregator::Aggregator,
   config::TracerConfig,
   event::{AllocationEvent, EventKind, StackId},
+  export::{
+    ExportError, JsonLinesWriter, MmapJsonStreamWriter, SnapshotStreamWriter,
+  },
   ring_buffer::{DrainAction, ThreadBuffer},
-  snapshot::{Snapshot, SnapshotDelta},
+  snapshot::{Snapshot, SnapshotDelta, SnapshotRecord},
   stack::{FrameMetadata, StackMetadata, StackTable},
   state::{Tracer, TracerBuilder},
 };
