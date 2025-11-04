@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(not(windows))]
+use pprof::protos::{Function, Line, Location, Profile, Sample, ValueType};
+
+#[cfg(not(windows))]
+use prost::Message;
+
 /// Errors that can occur when exporting or streaming snapshots.
 #[derive(Debug)]
 pub enum ExportError {
@@ -181,11 +187,13 @@ impl<'a> StreamChunk<'a> {
   }
 }
 
+#[cfg(not(windows))]
 struct StringTable {
   entries: Vec<String>,
   index: HashMap<String, i64>,
 }
 
+#[cfg(not(windows))]
 impl StringTable {
   fn intern(&mut self, value: &str) -> i64 {
     if let Some(index) = self.index.get(value) {
@@ -243,6 +251,7 @@ impl Snapshot {
   ///
   /// Returns an error if the snapshot cannot be encoded or written to the
   /// provided writer.
+  #[cfg(not(windows))]
   pub fn export_pprof<W: Write>(
     &self,
     mut writer: W,
@@ -252,6 +261,17 @@ impl Snapshot {
     profile.encode(&mut buffer)?;
     writer.write_all(&buffer)?;
     Ok(())
+  }
+
+  #[cfg(windows)]
+  pub fn export_pprof<W: Write>(&self, _writer: W) -> Result<(), ExportError> {
+    Err(
+      io::Error::new(
+        io::ErrorKind::Unsupported,
+        "pprof export is not available on Windows",
+      )
+      .into(),
+    )
   }
 
   /// Stream this snapshot into the provided writer.
@@ -286,6 +306,7 @@ fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
     .map(|duration| duration.as_nanos())
 }
 
+#[cfg(not(windows))]
 fn build_pprof_profile(snapshot: &Snapshot) -> Profile {
   let mut string_table = StringTable::new();
 

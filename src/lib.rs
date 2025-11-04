@@ -19,8 +19,6 @@ use {
   dashmap::{DashMap, mapref::entry::Entry},
   memmap2::MmapMut,
   nohash_hasher::BuildNoHashHasher,
-  pprof::protos::{Function, Line, Location, Profile, Sample, ValueType},
-  prost::Message,
   ring_buffer::ThreadBufferInner,
   serde::{Serialize, Serializer, ser::SerializeStruct},
   smallvec::SmallVec,

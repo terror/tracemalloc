@@ -31,6 +31,9 @@ use {
   },
 };
 
+#[cfg(windows)]
+use pyo3::exceptions::PyNotImplementedError;
+
 static STATE: RwLock<Option<Box<ShimState>>> = RwLock::new(None);
 
 thread_local! {
@@ -371,6 +374,7 @@ impl PySnapshot {
     Ok(())
   }
 
+  #[cfg(not(windows))]
   fn export_pprof(&self, path: &Bound<'_, PyAny>) -> PyResult<()> {
     let path = extract_path(path)?;
 
@@ -389,6 +393,13 @@ impl PySnapshot {
       .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     Ok(())
+  }
+
+  #[cfg(windows)]
+  fn export_pprof(&self, _path: &Bound<'_, PyAny>) -> PyResult<()> {
+    Err(PyNotImplementedError::new_err(
+      "pprof export is not available on Windows",
+    ))
   }
 
   fn stream_to_mmap(
