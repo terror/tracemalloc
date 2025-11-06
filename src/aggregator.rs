@@ -123,9 +123,18 @@ mod tests {
     let mut aggregator = Aggregator::new(Arc::clone(&stack_table));
 
     aggregator.ingest(vec![
-      AllocationEvent::new(EventKind::Allocation, 0x1, 128, 42),
-      AllocationEvent::new(EventKind::Allocation, 0x2, 64, 42),
-      AllocationEvent::new(EventKind::Deallocation, 0x2, 64, 42),
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(128)
+        .stack_id(42),
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x2)
+        .size(64)
+        .stack_id(42),
+      AllocationEvent::new(EventKind::Deallocation)
+        .address(0x2)
+        .size(64)
+        .stack_id(42),
     ]);
 
     let snapshot = aggregator.snapshot();
@@ -165,12 +174,12 @@ mod tests {
 
     let mut aggregator = Aggregator::new(stack_table);
 
-    aggregator.ingest(vec![AllocationEvent::new(
-      EventKind::Allocation,
-      0x1,
-      16,
-      7,
-    )]);
+    aggregator.ingest(vec![
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(16)
+        .stack_id(7),
+    ]);
 
     let snapshot = aggregator.snapshot();
     let record = snapshot.records().first().expect("missing record");

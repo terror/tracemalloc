@@ -119,12 +119,12 @@ mod tests {
     let buffer = ThreadBuffer::new(&config);
 
     assert_eq!(
-      buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0)),
+      buffer.record(AllocationEvent::new(EventKind::Allocation).size(1)),
       DrainAction::Noop
     );
 
     assert_eq!(
-      buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0)),
+      buffer.record(AllocationEvent::new(EventKind::Allocation).size(1)),
       DrainAction::FlushPending
     );
   }
@@ -134,7 +134,7 @@ mod tests {
     let buffer_config = TracerConfig::default();
 
     let buffer = ThreadBuffer::new(&buffer_config);
-    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0));
+    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation).size(1));
 
     let mut drained = Vec::new();
 
@@ -154,10 +154,10 @@ mod tests {
     };
 
     let buffer = ThreadBuffer::new(&config);
-    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0));
+    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation).size(1));
 
     // This should be dropped because the queue capacity is 1.
-    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation, 0, 1, 0));
+    let _ = buffer.record(AllocationEvent::new(EventKind::Allocation).size(1));
 
     let mut drained = Vec::new();
 

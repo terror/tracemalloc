@@ -273,6 +273,7 @@ impl TracerInner {
 
     let stack_collector =
       StackCollector::new(Arc::clone(&stack_table), &config);
+
     let sampling = SamplingState::new(&config);
 
     Self {
@@ -320,7 +321,12 @@ impl TracerInner {
           .allocation_index
           .insert(address, AllocationRecord { size, stack_id });
 
-        HotEvent::Sampled(AllocationEvent::new(kind, address, size, stack_id))
+        HotEvent::Sampled(
+          AllocationEvent::new(kind)
+            .address(address)
+            .size(size)
+            .stack_id(stack_id),
+        )
       }
       EventKind::Deallocation => {
         let Some((_, record)) = self.allocation_index.remove(&address) else {
@@ -333,12 +339,12 @@ impl TracerInner {
 
         let size = if size == 0 { record.size } else { size };
 
-        HotEvent::Sampled(AllocationEvent::new(
-          kind,
-          address,
-          size,
-          record.stack_id,
-        ))
+        HotEvent::Sampled(
+          AllocationEvent::new(kind)
+            .address(address)
+            .size(size)
+            .stack_id(record.stack_id),
+        )
       }
       EventKind::Dropped { .. } => HotEvent::Skipped,
     }
@@ -362,12 +368,10 @@ impl TracerInner {
 
     let recorded_old_size = if old_size == 0 { record.size } else { old_size };
 
-    let dealloc = AllocationEvent::new(
-      EventKind::Deallocation,
-      old_address,
-      recorded_old_size,
-      record.stack_id,
-    );
+    let dealloc = AllocationEvent::new(EventKind::Deallocation)
+      .address(old_address)
+      .size(recorded_old_size)
+      .stack_id(record.stack_id);
 
     if new_size == 0 || !self.sampling.should_sample(new_size) {
       return PreparedReallocation::Events {
@@ -388,12 +392,10 @@ impl TracerInner {
       },
     );
 
-    let alloc = AllocationEvent::new(
-      EventKind::Allocation,
-      new_address,
-      new_size,
-      stack_id,
-    );
+    let alloc = AllocationEvent::new(EventKind::Allocation)
+      .address(new_address)
+      .size(new_size)
+      .stack_id(stack_id);
 
     PreparedReallocation::Events {
       allocation: Some(alloc),
@@ -631,8 +633,7 @@ impl Tracer {
   }
 
   fn record_dropped_event(&self, count: u64) {
-    let dropped = EventKind::Dropped { count }.into();
-    self.enqueue_event(dropped);
+    self.enqueue_event(EventKind::Dropped { count }.into());
   }
 
   /// Feed a pre-built event directly into the per-thread buffer. A background worker
@@ -806,12 +807,12 @@ mod tests {
   fn disabled_tracer_drops_events() {
     let tracer = Tracer::builder().start_enabled(false).finish();
 
-    tracer.record_event(AllocationEvent::new(
-      EventKind::Allocation,
-      0x1,
-      16,
-      7,
-    ));
+    tracer.record_event(
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(16)
+        .stack_id(7),
+    );
 
     assert!(tracer.snapshot().records().is_empty());
   }
@@ -820,12 +821,12 @@ mod tests {
   fn enabled_tracer_collects_events() {
     let tracer = Tracer::new();
 
-    tracer.record_event(AllocationEvent::new(
-      EventKind::Allocation,
-      0x1,
-      16,
-      7,
-    ));
+    tracer.record_event(
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(16)
+        .stack_id(7),
+    );
 
     assert_eq!(tracer.snapshot().records().len(), 1);
   }
@@ -834,12 +835,12 @@ mod tests {
   fn snapshot_drains_thread_buffers() {
     let tracer = Tracer::new();
 
-    tracer.record_event(AllocationEvent::new(
-      EventKind::Allocation,
-      0x1,
-      8,
-      99,
-    ));
+    tracer.record_event(
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(8)
+        .stack_id(99),
+    );
 
     let snapshot = tracer.snapshot();
 
@@ -860,12 +861,12 @@ mod tests {
       .stack_table()
       .insert_with_id(123, vec![FrameMetadata::new("file.py", "fn", 1)]);
 
-    tracer.record_event(AllocationEvent::new(
-      EventKind::Allocation,
-      0x1,
-      8,
-      123,
-    ));
+    tracer.record_event(
+      AllocationEvent::new(EventKind::Allocation)
+        .address(0x1)
+        .size(8)
+        .stack_id(123),
+    );
 
     let snapshot = tracer.snapshot();
 
