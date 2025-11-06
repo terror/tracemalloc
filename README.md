@@ -20,9 +20,9 @@ following ways:
 - Broader visibility by optionally interposing on the native allocator, tagging
   allocations by domain/ thread/interpreter, and observing some extension-level
   allocations traditional tracemalloc misses.
-- Stronger tooling with streaming or
+- Stronger tooling with streaming and
   [mmap](https://en.wikipedia.org/wiki/Mmap)-backed snapshots, instantaneous
-  diffs, open exports ([pprof](https://github.com/google/pprof)/ Perfetto), and
+  diffs, open exports ([pprof](https://github.com/google/pprof) / Perfetto), and
   time-sliced queries for modern profiling workflows.
 - Robustness upgrades like reentrancy guards, lossy backoff when buffers fill,
   and careful shutdown handling to keep tracing safe even under stress.

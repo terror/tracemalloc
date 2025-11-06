@@ -212,6 +212,23 @@ fn is_tracing() -> bool {
 }
 
 #[pyfunction]
+fn clear(_py: Python<'_>) -> PyResult<()> {
+  let guard = STATE
+    .read()
+    .map_err(|_| PyRuntimeError::new_err("tracer state poisoned"))?;
+
+  let state = guard
+    .as_ref()
+    .ok_or_else(|| PyRuntimeError::new_err("tracer not started"))?;
+
+  state.tracer.reset();
+
+  state.clear_allocations();
+
+  Ok(())
+}
+
+#[pyfunction]
 fn take_snapshot(_py: Python<'_>) -> PyResult<PySnapshot> {
   let guard = STATE
     .read()
@@ -1014,6 +1031,7 @@ fn extract_bound_string(value: &Bound<'_, PyAny>) -> Option<String> {
 fn rust_tracemalloc(py: Python<'_>, module: &PyModule) -> PyResult<()> {
   module.add_function(wrap_pyfunction!(start, module)?)?;
   module.add_function(wrap_pyfunction!(stop, module)?)?;
+  module.add_function(wrap_pyfunction!(clear, module)?)?;
   module.add_function(wrap_pyfunction!(is_tracing, module)?)?;
   module.add_function(wrap_pyfunction!(take_snapshot, module)?)?;
   module.add_function(wrap_pyfunction!(compare_snapshots, module)?)?;
@@ -1074,5 +1092,91 @@ mod tests {
     assert_eq!(record.total_allocated, 96);
     assert_eq!(record.total_freed, 64);
     assert_eq!(record.current_bytes, 32);
+  }
+
+  #[test]
+  fn clear_resets_tracer_state_and_allocations() {
+    pyo3::prepare_freethreaded_python();
+
+    Python::with_gil(|py| {
+      start(
+        py,
+        None,
+        None,
+        Option::<Bound<'_, PyAny>>::None,
+        None,
+        Option::<Bound<'_, PyAny>>::None,
+      )
+      .expect("failed to start tracer");
+    });
+
+    let allocation_address = 0xDEADusize;
+    let allocation_size = 128usize;
+
+    {
+      let guard =
+        STATE.read().expect("tracer state lock poisoned for read access");
+
+      let state = guard.as_ref().expect("tracer not started");
+
+      state.record_allocation(allocation_address, allocation_size);
+
+      let allocations = state
+        .allocations
+        .lock()
+        .expect("allocation map lock poisoned");
+
+      assert_eq!(
+        allocations.get(&allocation_address),
+        Some(&allocation_size),
+        "allocation should be tracked before clear()"
+      );
+    }
+
+    {
+      let guard =
+        STATE.read().expect("tracer state lock poisoned for read access");
+
+      let state = guard.as_ref().expect("tracer not started");
+
+      let snapshot = state.tracer.snapshot();
+
+      assert!(
+        !snapshot.records().is_empty(),
+        "expected allocation record before clear()"
+      );
+    }
+
+    Python::with_gil(|py| {
+      clear(py).expect("clear() should succeed when tracer is started");
+    });
+
+    {
+      let guard =
+        STATE.read().expect("tracer state lock poisoned for read access");
+
+      let state = guard.as_ref().expect("tracer not started");
+
+      let allocations = state
+        .allocations
+        .lock()
+        .expect("allocation map lock poisoned");
+
+      assert!(
+        allocations.is_empty(),
+        "allocation map should be empty after clear()"
+      );
+
+      let snapshot = state.tracer.snapshot();
+
+      assert!(
+        snapshot.records().is_empty(),
+        "snapshot should be empty after clear()"
+      );
+    }
+
+    Python::with_gil(|py| {
+      stop(py).expect("stop() should succeed after clear()");
+    });
   }
 }
