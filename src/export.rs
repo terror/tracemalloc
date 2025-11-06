@@ -217,6 +217,89 @@ impl StringTable {
   }
 }
 
+#[cfg(not(windows))]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+struct FunctionKey {
+  filename: i64,
+  function: i64,
+  lineno: u32,
+}
+
+#[cfg(not(windows))]
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+struct LocationKey {
+  function_id: u64,
+  lineno: u32,
+}
+
+#[cfg(not(windows))]
+fn next_id(len: usize) -> u64 {
+  u64::try_from(len.saturating_add(1)).unwrap_or(u64::MAX)
+}
+
+#[cfg(not(windows))]
+fn intern_location_for_frame(
+  string_table: &mut StringTable,
+  function_ids: &mut HashMap<FunctionKey, u64>,
+  location_ids: &mut HashMap<LocationKey, u64>,
+  functions: &mut Vec<Function>,
+  locations: &mut Vec<Location>,
+  filename: &str,
+  function: &str,
+  lineno: u32,
+) -> u64 {
+  let filename_idx = string_table.intern(filename);
+  let function_name_idx = string_table.intern(function);
+
+  let function_id = *function_ids
+    .entry(FunctionKey {
+      filename: filename_idx,
+      function: function_name_idx,
+      lineno,
+    })
+    .or_insert_with(|| {
+      let id = next_id(functions.len());
+
+      let function = Function {
+        id,
+        name: function_name_idx,
+        system_name: function_name_idx,
+        filename: filename_idx,
+        start_line: i64::from(lineno),
+      };
+
+      functions.push(function);
+
+      id
+    });
+
+  *location_ids
+    .entry(LocationKey {
+      function_id,
+      lineno,
+    })
+    .or_insert_with(|| {
+      let id = next_id(locations.len());
+
+      let line = Line {
+        function_id,
+        line: i64::from(lineno),
+      };
+
+      let location = Location {
+        id,
+        mapping_id: 0,
+        address: 0,
+        line: vec![line],
+        is_folded: false,
+      };
+
+      locations.push(location);
+
+      id
+    })
+}
+
 fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
   ts.duration_since(SystemTime::UNIX_EPOCH)
     .ok()
@@ -227,139 +310,65 @@ fn system_time_to_nanos(ts: SystemTime) -> Option<u128> {
 pub fn build_pprof_profile(snapshot: &Snapshot) -> Profile {
   let mut string_table = StringTable::new();
 
-  let mut functions = Vec::new();
-  let mut locations = Vec::new();
-  let mut samples = Vec::new();
+  let (mut functions, mut locations, mut samples) =
+    (Vec::new(), Vec::new(), Vec::new());
 
-  let sample_type = ValueType {
-    ty: string_table.intern("space"),
-    unit: string_table.intern("bytes"),
-  };
-
-  let count_type = ValueType {
-    ty: string_table.intern("allocations"),
-    unit: string_table.intern("count"),
-  };
-
-  let mut function_ids = HashMap::new();
-  let mut location_ids = HashMap::new();
-
-  let mut next_function_id = 1;
-  let mut next_location_id = 1;
+  let (mut function_ids, mut location_ids) = (HashMap::new(), HashMap::new());
 
   for record in snapshot.records() {
     let mut stack_location_ids = Vec::new();
 
     if let Some(stack) = &record.stack {
       for frame in stack.frames() {
-        let filename_idx = string_table.intern(frame.filename.as_ref());
-
-        let function_name_idx = string_table.intern(frame.function.as_ref());
-
-        let function_id = *function_ids
-          .entry((filename_idx, function_name_idx, frame.lineno))
-          .or_insert_with(|| {
-            let function = Function {
-              id: next_function_id,
-              name: function_name_idx,
-              system_name: function_name_idx,
-              filename: filename_idx,
-              start_line: i64::from(frame.lineno),
-            };
-
-            functions.push(function);
-
-            next_function_id += 1;
-            next_function_id - 1
-          });
-
-        let location_id = *location_ids
-          .entry((function_id, frame.lineno))
-          .or_insert_with(|| {
-            let line = Line {
-              function_id,
-              line: i64::from(frame.lineno),
-            };
-
-            let location = Location {
-              id: next_location_id,
-              mapping_id: 0,
-              address: 0,
-              line: vec![line],
-              is_folded: false,
-            };
-
-            locations.push(location);
-
-            next_location_id += 1;
-            next_location_id - 1
-          });
-
-        stack_location_ids.push(location_id);
+        stack_location_ids.push(intern_location_for_frame(
+          &mut string_table,
+          &mut function_ids,
+          &mut location_ids,
+          &mut functions,
+          &mut locations,
+          frame.filename.as_ref(),
+          frame.function.as_ref(),
+          frame.lineno,
+        ));
       }
     }
 
     if stack_location_ids.is_empty() {
       // Provide a synthetic frame when we have no metadata so tools still show
       // the allocation bucket.
-      let unknown_label = string_table.intern("<unknown>");
-
-      let function_id = *function_ids
-        .entry((unknown_label, unknown_label, 0))
-        .or_insert_with(|| {
-          let function = Function {
-            id: next_function_id,
-            name: unknown_label,
-            system_name: unknown_label,
-            filename: unknown_label,
-            start_line: 0,
-          };
-
-          functions.push(function);
-
-          next_function_id += 1;
-          next_function_id - 1
-        });
-
-      let location_id =
-        *location_ids.entry((function_id, 0)).or_insert_with(|| {
-          let line = Line {
-            function_id,
-            line: 0,
-          };
-
-          let location = Location {
-            id: next_location_id,
-            mapping_id: 0,
-            address: 0,
-            line: vec![line],
-            is_folded: false,
-          };
-
-          locations.push(location);
-
-          next_location_id += 1;
-          next_location_id - 1
-        });
-
-      stack_location_ids.push(location_id);
+      stack_location_ids.push(intern_location_for_frame(
+        &mut string_table,
+        &mut function_ids,
+        &mut location_ids,
+        &mut functions,
+        &mut locations,
+        "<unknown>",
+        "<unknown>",
+        0,
+      ));
     }
 
-    let bytes_value = record.current_bytes;
-
-    let count_value = i64::try_from(record.allocations).unwrap_or(i64::MAX);
-
-    let sample = Sample {
+    samples.push(Sample {
       location_id: stack_location_ids,
-      value: vec![bytes_value, count_value],
+      value: vec![
+        record.current_bytes,
+        i64::try_from(record.allocations).unwrap_or(i64::MAX),
+      ],
       label: Vec::new(),
-    };
-
-    samples.push(sample);
+    });
   }
 
   Profile {
-    sample_type: vec![sample_type, count_type],
+    sample_type: vec![
+      ValueType {
+        ty: string_table.intern("space"),
+        unit: string_table.intern("bytes"),
+      },
+      ValueType {
+        ty: string_table.intern("allocations"),
+        unit: string_table.intern("count"),
+      },
+    ],
     sample: samples,
     mapping: Vec::new(),
     location: locations,
@@ -373,5 +382,110 @@ pub fn build_pprof_profile(snapshot: &Snapshot) -> Profile {
     period: 1,
     comment: Vec::new(),
     default_sample_type: 0,
+  }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+  use super::*;
+
+  fn make_stack(
+    frames: Vec<FrameMetadata>,
+    stack_id: StackId,
+  ) -> Arc<StackMetadata> {
+    let table = StackTable::new();
+    table.insert_with_id(stack_id, frames);
+    table.resolve(stack_id).expect("stack metadata available")
+  }
+
+  fn snapshot_record(
+    stack: Option<Arc<StackMetadata>>,
+    current_bytes: i64,
+    allocations: u64,
+  ) -> SnapshotRecord {
+    let stack_id = stack
+      .as_ref()
+      .map_or(StackId::default(), |metadata| metadata.id());
+
+    SnapshotRecord {
+      allocations,
+      current_bytes,
+      deallocations: 0,
+      stack,
+      stack_id,
+      total_allocated: current_bytes.try_into().unwrap_or_default(),
+      total_freed: 0,
+    }
+  }
+
+  fn build_snapshot(records: Vec<SnapshotRecord>) -> Snapshot {
+    Snapshot::new(records, 0)
+  }
+
+  #[test]
+  fn build_pprof_profile_deduplicates_frames() {
+    let stack = make_stack(vec![FrameMetadata::new("app.py", "render", 42)], 1);
+
+    let snapshot = build_snapshot(vec![
+      snapshot_record(Some(stack.clone()), 256, 1),
+      snapshot_record(Some(stack), 128, 2),
+    ]);
+
+    let profile = build_pprof_profile(&snapshot);
+
+    assert_eq!(profile.function.len(), 1);
+    assert_eq!(profile.location.len(), 1);
+    assert_eq!(profile.sample.len(), 2);
+    assert_eq!(profile.sample_type.len(), 2);
+
+    let location_id = profile.location[0].id;
+
+    for (sample, expected) in profile
+      .sample
+      .iter()
+      .zip([[256_i64, 1_i64], [128, 2]].into_iter())
+    {
+      assert_eq!(sample.location_id, vec![location_id]);
+      assert_eq!(sample.value.as_slice(), expected);
+    }
+
+    let function = &profile.function[0];
+
+    let filename =
+      &profile.string_table[usize::try_from(function.filename).unwrap()];
+
+    let name = &profile.string_table[usize::try_from(function.name).unwrap()];
+
+    assert_eq!(filename, "app.py");
+    assert_eq!(name, "render");
+  }
+
+  #[test]
+  fn build_pprof_profile_inserts_unknown_frame() {
+    let snapshot = build_snapshot(vec![snapshot_record(None, 512, 3)]);
+
+    let profile = build_pprof_profile(&snapshot);
+
+    assert_eq!(profile.function.len(), 1);
+    assert_eq!(profile.location.len(), 1);
+    assert_eq!(profile.sample.len(), 1);
+
+    let function = &profile.function[0];
+    let name = &profile.string_table[usize::try_from(function.name).unwrap()];
+
+    let filename =
+      &profile.string_table[usize::try_from(function.filename).unwrap()];
+
+    assert_eq!(name, "<unknown>");
+    assert_eq!(filename, "<unknown>");
+
+    let location = &profile.location[0];
+
+    assert_eq!(location.line.len(), 1);
+    assert_eq!(location.line[0].line, 0);
+    assert_eq!(location.line[0].function_id, function.id);
+
+    assert_eq!(profile.sample[0].location_id, vec![profile.location[0].id]);
+    assert_eq!(profile.sample[0].value, vec![512, 3]);
   }
 }
