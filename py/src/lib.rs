@@ -1009,6 +1009,32 @@ fn extract_bound_string(value: &Bound<'_, PyAny>) -> Option<String> {
   })
 }
 
+
+
+#[allow(deprecated)]
+#[pymodule]
+fn rust_tracemalloc(py: Python<'_>, module: &PyModule) -> PyResult<()> {
+  module.add_function(wrap_pyfunction!(start, module)?)?;
+  module.add_function(wrap_pyfunction!(stop, module)?)?;
+  module.add_function(wrap_pyfunction!(is_tracing, module)?)?;
+  module.add_function(wrap_pyfunction!(take_snapshot, module)?)?;
+  module.add_function(wrap_pyfunction!(compare_snapshots, module)?)?;
+  module.add_function(wrap_pyfunction!(open_snapshot_stream, module)?)?;
+
+  module.add_class::<PySnapshot>()?;
+  module.add_class::<PySnapshotDelta>()?;
+  module.add_class::<SnapshotStream>()?;
+
+  let version = PyDict::new_bound(py);
+  version.set_item("major", 0)?;
+  version.set_item("minor", 1)?;
+  version.set_item("patch", 0)?;
+
+  module.add("version_info", version.unbind())?;
+
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1051,28 +1077,4 @@ mod tests {
     assert_eq!(record.total_freed, 64);
     assert_eq!(record.current_bytes, 32);
   }
-}
-
-#[allow(deprecated)]
-#[pymodule]
-fn rust_tracemalloc(py: Python<'_>, module: &PyModule) -> PyResult<()> {
-  module.add_function(wrap_pyfunction!(start, module)?)?;
-  module.add_function(wrap_pyfunction!(stop, module)?)?;
-  module.add_function(wrap_pyfunction!(is_tracing, module)?)?;
-  module.add_function(wrap_pyfunction!(take_snapshot, module)?)?;
-  module.add_function(wrap_pyfunction!(compare_snapshots, module)?)?;
-  module.add_function(wrap_pyfunction!(open_snapshot_stream, module)?)?;
-
-  module.add_class::<PySnapshot>()?;
-  module.add_class::<PySnapshotDelta>()?;
-  module.add_class::<SnapshotStream>()?;
-
-  let version = PyDict::new_bound(py);
-  version.set_item("major", 0)?;
-  version.set_item("minor", 1)?;
-  version.set_item("patch", 0)?;
-
-  module.add("version_info", version.unbind())?;
-
-  Ok(())
 }
