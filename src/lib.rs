@@ -3,16 +3,6 @@
 //! The goal of this crate is to provide a low-overhead, highly concurrent memory
 //! trace collector that can be surfaced to Python through an FFI layer.
 
-mod aggregator;
-mod config;
-mod event;
-mod export;
-mod ring_buffer;
-mod snapshot;
-mod stack;
-mod stack_capture;
-mod state;
-
 use {
   backtrace::{Frame, SymbolName},
   crossbeam_queue::ArrayQueue,
@@ -40,6 +30,16 @@ use {
     time::{Duration, Instant, SystemTime},
   },
 };
+
+mod aggregator;
+mod config;
+mod event;
+mod export;
+mod ring_buffer;
+mod snapshot;
+mod stack;
+mod stack_capture;
+mod state;
 
 #[cfg(not(windows))]
 use export::build_pprof_profile;

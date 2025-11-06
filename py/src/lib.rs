@@ -1009,8 +1009,6 @@ fn extract_bound_string(value: &Bound<'_, PyAny>) -> Option<String> {
   })
 }
 
-
-
 #[allow(deprecated)]
 #[pymodule]
 fn rust_tracemalloc(py: Python<'_>, module: &PyModule) -> PyResult<()> {
