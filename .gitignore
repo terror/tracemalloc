@@ -49,6 +49,7 @@
 .venv
 .webassets-cache
 /site
+AGENTS.md
 ENV/
 MANIFEST
 __marimo__/
