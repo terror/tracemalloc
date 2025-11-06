@@ -42,6 +42,49 @@ struct SamplingState {
   rate: SamplingRate,
 }
 
+impl SamplingState {
+  fn is_enabled(&self) -> bool {
+    self.bytes.is_some() || !matches!(self.rate, SamplingRate::All)
+  }
+
+  fn new(config: &TracerConfig) -> Self {
+    let bytes = config
+      .sampling_bytes
+      .and_then(std::num::NonZeroU64::new)
+      .map(SamplingBytes::new);
+
+    let rate = if bytes.is_some() {
+      SamplingRate::All
+    } else if config.sampling_rate <= 0.0 {
+      SamplingRate::None
+    } else if config.sampling_rate >= 1.0 {
+      SamplingRate::All
+    } else {
+      SamplingRate::Fraction(config.sampling_rate)
+    };
+
+    Self { bytes, rate }
+  }
+
+  fn should_sample(&self, size: usize) -> bool {
+    if let Some(bytes) = &self.bytes {
+      return bytes.should_sample(size);
+    }
+
+    match self.rate {
+      SamplingRate::All => true,
+      SamplingRate::None => false,
+      SamplingRate::Fraction(probability) => {
+        debug_assert!(
+          (0.0..=1.0).contains(&probability),
+          "probability must be clamped to [0.0, 1.0]"
+        );
+        fastrand::f64() < probability
+      }
+    }
+  }
+}
+
 #[derive(Debug)]
 struct SamplingBytes {
   interval: std::num::NonZeroU64,
@@ -96,49 +139,6 @@ enum SamplingRate {
   All,
   Fraction(f64),
   None,
-}
-
-impl SamplingState {
-  fn is_enabled(&self) -> bool {
-    self.bytes.is_some() || !matches!(self.rate, SamplingRate::All)
-  }
-
-  fn new(config: &TracerConfig) -> Self {
-    let bytes = config
-      .sampling_bytes
-      .and_then(std::num::NonZeroU64::new)
-      .map(SamplingBytes::new);
-
-    let rate = if bytes.is_some() {
-      SamplingRate::All
-    } else if config.sampling_rate <= 0.0 {
-      SamplingRate::None
-    } else if config.sampling_rate >= 1.0 {
-      SamplingRate::All
-    } else {
-      SamplingRate::Fraction(config.sampling_rate)
-    };
-
-    Self { bytes, rate }
-  }
-
-  fn should_sample(&self, size: usize) -> bool {
-    if let Some(bytes) = &self.bytes {
-      return bytes.should_sample(size);
-    }
-
-    match self.rate {
-      SamplingRate::All => true,
-      SamplingRate::None => false,
-      SamplingRate::Fraction(probability) => {
-        debug_assert!(
-          (0.0..=1.0).contains(&probability),
-          "probability must be clamped to [0.0, 1.0]"
-        );
-        fastrand::f64() < probability
-      }
-    }
-  }
 }
 
 /// Thin builder that customizes `TracerConfig` without exposing all knobs up front.
