@@ -1,9 +1,6 @@
 """
 Demonstration script that activates the Rust tracemalloc shim, drives a synthetic
 allocation workload, and prints the heaviest Python call sites.
-
-Run with ``python main.py`` from an environment where ``rust_tracemalloc`` has
-been installed (see README).
 """
 
 from __future__ import annotations
