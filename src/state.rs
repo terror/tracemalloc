@@ -249,12 +249,7 @@ impl TracerInner {
           let dropped = buffer.drain_into(&mut events);
 
           if dropped > 0 {
-            events.push(AllocationEvent::new(
-              EventKind::Dropped { count: dropped },
-              0,
-              0,
-              0,
-            ));
+            events.push(EventKind::Dropped { count: dropped }.into());
           }
 
           true
@@ -636,7 +631,7 @@ impl Tracer {
   }
 
   fn record_dropped_event(&self, count: u64) {
-    let dropped = AllocationEvent::new(EventKind::Dropped { count }, 0, 0, 0);
+    let dropped = EventKind::Dropped { count }.into();
     self.enqueue_event(dropped);
   }
 

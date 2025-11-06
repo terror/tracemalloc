@@ -31,6 +31,12 @@ impl AllocationEvent {
   }
 }
 
+impl From<EventKind> for AllocationEvent {
+  fn from(kind: EventKind) -> Self {
+    Self::new(kind, 0, 0, 0)
+  }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EventKind {
   Allocation,

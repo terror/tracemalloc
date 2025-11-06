@@ -149,12 +149,7 @@ mod tests {
 
     let mut aggregator = Aggregator::new(stack_table);
 
-    aggregator.ingest(vec![AllocationEvent::new(
-      EventKind::Dropped { count: 5 },
-      0,
-      0,
-      0,
-    )]);
+    aggregator.ingest(vec![EventKind::Dropped { count: 5 }.into()]);
 
     let snapshot = aggregator.snapshot();
 
